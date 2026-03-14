@@ -10,6 +10,7 @@ import (
 type Config struct {
 	Port      string
 	DSN       string
+	DBDriver  string // "mysql" (default), "postgres", "sqlite"
 	RateLimit float64
 	RateBurst int
 
@@ -62,6 +63,7 @@ func Load() (*Config, error) {
 	cfg := &Config{
 		Port:                  envOr("MNEMO_PORT", "8080"),
 		DSN:                   dsn,
+		DBDriver:              envOr("MNEMO_DB_DRIVER", "mysql"),
 		RateLimit:             envFloat("MNEMO_RATE_LIMIT", 100),
 		RateBurst:             envInt("MNEMO_RATE_BURST", 200),
 		EmbedAutoModel:        os.Getenv("MNEMO_EMBED_AUTO_MODEL"),
@@ -85,6 +87,14 @@ func Load() (*Config, error) {
 		FTSEnabled:            envBool("MNEMO_FTS_ENABLED", false),
 		WorkerConcurrency:     envInt("MNEMO_WORKER_CONCURRENCY", 5),
 	}
+	// Validate DB driver.
+	switch cfg.DBDriver {
+	case "mysql", "postgres", "sqlite":
+		// ok
+	default:
+		return nil, fmt.Errorf("unsupported MNEMO_DB_DRIVER %q; valid values are \"mysql\", \"postgres\", \"sqlite\"", cfg.DBDriver)
+	}
+
 	// Validate ingest mode.
 	switch cfg.IngestMode {
 	case "smart", "raw", "":

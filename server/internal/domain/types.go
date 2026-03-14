@@ -107,14 +107,34 @@ type Tenant struct {
 	DeletedAt     *time.Time   `json:"-"`
 }
 
-// DSN builds a MySQL connection string for this tenant's database.
+// DSN builds a connection string for the configured driver.
+// For MySQL/TiDB: user:pass@tcp(host:port)/db?parseTime=true
+// For PostgreSQL: postgres://user:pass@host:port/db?sslmode=...
+// For SQLite: the DBHost field is used as the file path.
 func (t *Tenant) DSN() string {
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true",
-		t.DBUser, t.DBPassword, t.DBHost, t.DBPort, t.DBName)
-	if t.DBTLS {
-		dsn += "&tls=true"
+	return t.DSNForDriver(t.Provider)
+}
+
+// DSNForDriver builds a connection string for the given driver.
+func (t *Tenant) DSNForDriver(driver string) string {
+	switch driver {
+	case "postgres":
+		sslmode := "disable"
+		if t.DBTLS {
+			sslmode = "require"
+		}
+		return fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=%s",
+			t.DBUser, t.DBPassword, t.DBHost, t.DBPort, t.DBName, sslmode)
+	case "sqlite":
+		return t.DBHost // file path
+	default: // mysql
+		dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true",
+			t.DBUser, t.DBPassword, t.DBHost, t.DBPort, t.DBName)
+		if t.DBTLS {
+			dsn += "&tls=true"
+		}
+		return dsn
 	}
-	return dsn
 }
 
 // TenantToken represents an API token bound to a tenant.

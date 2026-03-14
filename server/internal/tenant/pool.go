@@ -16,6 +16,7 @@ type TenantPool struct {
 	lifetime    time.Duration
 	idleTimeout time.Duration
 	totalLimit  int
+	driver      string // "mysql", "postgres", "sqlite"
 	stopCh      chan struct{}
 }
 
@@ -31,6 +32,7 @@ type PoolConfig struct {
 	Lifetime    time.Duration
 	IdleTimeout time.Duration
 	TotalLimit  int
+	Driver      string // "mysql", "postgres", "sqlite"
 }
 
 func NewPool(cfg PoolConfig) *TenantPool {
@@ -49,6 +51,9 @@ func NewPool(cfg PoolConfig) *TenantPool {
 	if cfg.TotalLimit == 0 {
 		cfg.TotalLimit = 200
 	}
+	if cfg.Driver == "" {
+		cfg.Driver = "mysql"
+	}
 
 	p := &TenantPool{
 		conns:       make(map[string]*tenantConn),
@@ -57,6 +62,7 @@ func NewPool(cfg PoolConfig) *TenantPool {
 		lifetime:    cfg.Lifetime,
 		idleTimeout: cfg.IdleTimeout,
 		totalLimit:  cfg.TotalLimit,
+		driver:      cfg.Driver,
 		stopCh:      make(chan struct{}),
 	}
 
@@ -95,7 +101,8 @@ func (p *TenantPool) Get(ctx context.Context, tenantID string, dsn string) (*sql
 		return nil, fmt.Errorf("tenant pool: total limit %d reached", p.totalLimit)
 	}
 
-	db, err := sql.Open("mysql", dsn)
+	driverName := driverForName(p.driver)
+	db, err := sql.Open(driverName, dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -103,6 +110,10 @@ func (p *TenantPool) Get(ctx context.Context, tenantID string, dsn string) (*sql
 	db.SetMaxIdleConns(p.maxIdle)
 	db.SetMaxOpenConns(p.maxOpen)
 	db.SetConnMaxLifetime(p.lifetime)
+
+	if p.driver == "sqlite" {
+		db.SetMaxOpenConns(1)
+	}
 
 	if err := db.PingContext(ctx); err != nil {
 		_ = db.Close()
@@ -170,6 +181,20 @@ func (p *TenantPool) evictLoop() {
 		case <-p.stopCh:
 			return
 		}
+	}
+}
+
+// Driver returns the database driver name configured for this pool.
+func (p *TenantPool) Driver() string { return p.driver }
+
+func driverForName(driver string) string {
+	switch driver {
+	case "postgres":
+		return "pgx"
+	case "sqlite":
+		return "sqlite"
+	default:
+		return "mysql"
 	}
 }
 

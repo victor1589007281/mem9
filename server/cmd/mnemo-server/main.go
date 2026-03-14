@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"log/slog"
 	"net/http"
 	"os"
@@ -14,6 +15,9 @@ import (
 	"github.com/qiffang/mnemos/server/internal/handler"
 	"github.com/qiffang/mnemos/server/internal/llm"
 	"github.com/qiffang/mnemos/server/internal/middleware"
+	"github.com/qiffang/mnemos/server/internal/repository"
+	"github.com/qiffang/mnemos/server/internal/repository/postgres"
+	"github.com/qiffang/mnemos/server/internal/repository/sqlite"
 	"github.com/qiffang/mnemos/server/internal/repository/tidb"
 	"github.com/qiffang/mnemos/server/internal/service"
 	"github.com/qiffang/mnemos/server/internal/tenant"
@@ -28,12 +32,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	db, err := tidb.NewDB(cfg.DSN)
+	db, err := openDB(cfg.DBDriver, cfg.DSN)
 	if err != nil {
-		logger.Error("failed to connect database", "err", err)
+		logger.Error("failed to connect database", "err", err, "driver", cfg.DBDriver)
 		os.Exit(1)
 	}
 	defer db.Close()
+	logger.Info("database connected", "driver", cfg.DBDriver)
 
 	// Embedder (nil if not configured → keyword-only search).
 	embedder := embed.New(embed.Config{
@@ -62,14 +67,14 @@ func main() {
 		logger.Info("no LLM configured, ingest will use raw mode")
 	}
 
-	// Repositories.
-	tenantRepo := tidb.NewTenantRepo(db)
-	uploadTaskRepo := tidb.NewUploadTaskRepo(db)
+	// Repositories — selected by driver.
+	tenantRepo, uploadTaskRepo := newRepos(cfg.DBDriver, db)
 	tenantPool := tenant.NewPool(tenant.PoolConfig{
 		MaxIdle:     cfg.TenantPoolMaxIdle,
 		MaxOpen:     cfg.TenantPoolMaxOpen,
 		IdleTimeout: cfg.TenantPoolIdleTimeout,
 		TotalLimit:  cfg.TenantPoolTotalLimit,
+		Driver:      cfg.DBDriver,
 	})
 	defer tenantPool.Close()
 
@@ -78,7 +83,7 @@ func main() {
 	if cfg.TiDBZeroEnabled {
 		zeroClient = tenant.NewZeroClient(cfg.TiDBZeroAPIURL)
 	}
-	tenantSvc := service.NewTenantService(tenantRepo, zeroClient, tenantPool, logger, cfg.EmbedAutoModel, cfg.EmbedAutoDims, cfg.FTSEnabled)
+	tenantSvc := service.NewTenantService(tenantRepo, zeroClient, tenantPool, logger, cfg.EmbedAutoModel, cfg.EmbedAutoDims, cfg.FTSEnabled, cfg.DBDriver)
 
 	// Middleware.
 	tenantMW := middleware.ResolveTenant(tenantRepo, tenantPool)
@@ -87,7 +92,10 @@ func main() {
 	rateMW := rl.Middleware()
 
 	// Handler.
-	srv := handler.NewServer(tenantSvc, uploadTaskRepo, cfg.UploadDir, embedder, llmClient, cfg.EmbedAutoModel, cfg.FTSEnabled, service.IngestMode(cfg.IngestMode), logger)
+	memRepoFactory := func(db *sql.DB, autoModel string, ftsEnabled bool) repository.MemoryRepo {
+		return newMemoryRepo(cfg.DBDriver, db, autoModel, ftsEnabled)
+	}
+	srv := handler.NewServer(tenantSvc, uploadTaskRepo, cfg.UploadDir, embedder, llmClient, cfg.EmbedAutoModel, cfg.FTSEnabled, service.IngestMode(cfg.IngestMode), logger, memRepoFactory)
 	router := srv.Router(tenantMW, rateMW)
 
 	httpSrv := &http.Server{
@@ -141,4 +149,37 @@ func main() {
 		os.Exit(1)
 	}
 	logger.Info("server stopped")
+}
+
+func openDB(driver, dsn string) (*sql.DB, error) {
+	switch driver {
+	case "postgres":
+		return postgres.NewDB(dsn)
+	case "sqlite":
+		return sqlite.NewDB(dsn)
+	default:
+		return tidb.NewDB(dsn)
+	}
+}
+
+func newRepos(driver string, db *sql.DB) (repository.TenantRepo, repository.UploadTaskRepo) {
+	switch driver {
+	case "postgres":
+		return postgres.NewTenantRepo(db), postgres.NewUploadTaskRepo(db)
+	case "sqlite":
+		return sqlite.NewTenantRepo(db), sqlite.NewUploadTaskRepo(db)
+	default:
+		return tidb.NewTenantRepo(db), tidb.NewUploadTaskRepo(db)
+	}
+}
+
+func newMemoryRepo(driver string, db *sql.DB, autoModel string, ftsEnabled bool) repository.MemoryRepo {
+	switch driver {
+	case "postgres":
+		return postgres.NewMemoryRepo(db, autoModel, ftsEnabled)
+	case "sqlite":
+		return sqlite.NewMemoryRepo(db, autoModel, ftsEnabled)
+	default:
+		return tidb.NewMemoryRepo(db, autoModel, ftsEnabled)
+	}
 }

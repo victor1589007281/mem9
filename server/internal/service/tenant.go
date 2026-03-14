@@ -2,10 +2,12 @@ package service
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
+	"strings"
 
 	"github.com/go-sql-driver/mysql"
 	"github.com/qiffang/mnemos/server/internal/domain"
@@ -56,6 +58,7 @@ type TenantService struct {
 	autoModel  string
 	autoDims   int
 	ftsEnabled bool
+	dbDriver   string
 }
 
 func NewTenantService(
@@ -66,7 +69,11 @@ func NewTenantService(
 	autoModel string,
 	autoDims int,
 	ftsEnabled bool,
+	dbDriver string,
 ) *TenantService {
+	if dbDriver == "" {
+		dbDriver = "mysql"
+	}
 	return &TenantService{
 		tenants:    tenants,
 		zero:       zero,
@@ -75,6 +82,7 @@ func NewTenantService(
 		autoModel:  autoModel,
 		autoDims:   autoDims,
 		ftsEnabled: ftsEnabled,
+		dbDriver:   dbDriver,
 	}
 }
 
@@ -147,7 +155,7 @@ func (s *TenantService) GetInfo(ctx context.Context, tenantID string) (*domain.T
 	if s.pool == nil {
 		return nil, fmt.Errorf("tenant pool not configured")
 	}
-	db, err := s.pool.Get(ctx, tenantID, t.DSN())
+	db, err := s.pool.Get(ctx, tenantID, t.DSNForDriver(s.dbDriver))
 	if err != nil {
 		return nil, err
 	}
@@ -171,11 +179,25 @@ func (s *TenantService) initSchema(ctx context.Context, t *domain.Tenant) error 
 	if s.pool == nil {
 		return fmt.Errorf("tenant pool not configured")
 	}
-	db, err := s.pool.Get(ctx, t.ID, t.DSN())
+	dsn := t.DSNForDriver(s.dbDriver)
+	db, err := s.pool.Get(ctx, t.ID, dsn)
 	if err != nil {
 		return err
 	}
-	if _, err := db.ExecContext(ctx, buildMemorySchema(s.autoModel, s.autoDims)); err != nil {
+
+	switch s.dbDriver {
+	case "postgres":
+		return s.initSchemaPostgres(ctx, db)
+	case "sqlite":
+		return s.initSchemaSQLite(ctx, db)
+	default:
+		return s.initSchemaMySQL(ctx, db)
+	}
+}
+
+func (s *TenantService) initSchemaMySQL(ctx context.Context, db *sql.DB) error {
+	schema := buildMemorySchema(s.autoModel, s.autoDims)
+	if _, err := db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("init tenant schema: memories: %w", err)
 	}
 	if s.autoModel != "" {
@@ -195,10 +217,94 @@ func (s *TenantService) initSchema(ctx context.Context, t *domain.Tenant) error 
 	return nil
 }
 
+func (s *TenantService) initSchemaPostgres(ctx context.Context, db *sql.DB) error {
+	schema := `CREATE TABLE IF NOT EXISTS memories (
+		id              VARCHAR(36)     PRIMARY KEY,
+		content         TEXT            NOT NULL,
+		source          VARCHAR(100),
+		tags            JSONB,
+		metadata        JSONB,
+		embedding       vector(1536)    NULL,
+		memory_type     VARCHAR(20)     NOT NULL DEFAULT 'pinned',
+		agent_id        VARCHAR(100)    NULL,
+		session_id      VARCHAR(100)    NULL,
+		state           VARCHAR(20)     NOT NULL DEFAULT 'active',
+		version         INT             DEFAULT 1,
+		updated_by      VARCHAR(100),
+		created_at      TIMESTAMP       DEFAULT CURRENT_TIMESTAMP,
+		updated_at      TIMESTAMP       DEFAULT CURRENT_TIMESTAMP,
+		superseded_by   VARCHAR(36)     NULL
+	)`
+	if _, err := db.ExecContext(ctx, schema); err != nil {
+		return fmt.Errorf("init tenant schema: memories: %w", err)
+	}
+	indexes := []string{
+		`CREATE INDEX IF NOT EXISTS idx_memory_type ON memories(memory_type)`,
+		`CREATE INDEX IF NOT EXISTS idx_source ON memories(source)`,
+		`CREATE INDEX IF NOT EXISTS idx_state ON memories(state)`,
+		`CREATE INDEX IF NOT EXISTS idx_agent ON memories(agent_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_session ON memories(session_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_updated ON memories(updated_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_fts_content ON memories USING gin(to_tsvector('simple', content))`,
+	}
+	for _, idx := range indexes {
+		if _, err := db.ExecContext(ctx, idx); err != nil && !isIndexExistsError(err) {
+			s.logger.Warn("pg index creation skipped", "err", err)
+		}
+	}
+	return nil
+}
+
+func (s *TenantService) initSchemaSQLite(ctx context.Context, db *sql.DB) error {
+	schema := `CREATE TABLE IF NOT EXISTS memories (
+		id              TEXT     PRIMARY KEY,
+		content         TEXT     NOT NULL,
+		source          TEXT,
+		tags            TEXT,
+		metadata        TEXT,
+		embedding       TEXT     NULL,
+		memory_type     TEXT     NOT NULL DEFAULT 'pinned',
+		agent_id        TEXT     NULL,
+		session_id      TEXT     NULL,
+		state           TEXT     NOT NULL DEFAULT 'active',
+		version         INTEGER  DEFAULT 1,
+		updated_by      TEXT,
+		created_at      TEXT     DEFAULT (datetime('now')),
+		updated_at      TEXT     DEFAULT (datetime('now')),
+		superseded_by   TEXT     NULL
+	)`
+	if _, err := db.ExecContext(ctx, schema); err != nil {
+		return fmt.Errorf("init tenant schema: memories: %w", err)
+	}
+	indexes := []string{
+		`CREATE INDEX IF NOT EXISTS idx_memory_type ON memories(memory_type)`,
+		`CREATE INDEX IF NOT EXISTS idx_source ON memories(source)`,
+		`CREATE INDEX IF NOT EXISTS idx_state ON memories(state)`,
+		`CREATE INDEX IF NOT EXISTS idx_agent ON memories(agent_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_session ON memories(session_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_updated ON memories(updated_at)`,
+	}
+	for _, idx := range indexes {
+		if _, err := db.ExecContext(ctx, idx); err != nil {
+			s.logger.Warn("sqlite index creation skipped", "err", err)
+		}
+	}
+	if s.ftsEnabled {
+		_, err := db.ExecContext(ctx, `CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(content, id UNINDEXED)`)
+		if err != nil {
+			s.logger.Warn("sqlite FTS5 table creation skipped", "err", err)
+		}
+	}
+	return nil
+}
+
 func isIndexExistsError(err error) bool {
 	var mysqlErr *mysql.MySQLError
 	if errors.As(err, &mysqlErr) {
 		return mysqlErr.Number == 1061
+	}
+	if strings.Contains(err.Error(), "already exists") {
+		return true
 	}
 	return false
 }

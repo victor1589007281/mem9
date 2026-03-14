@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,22 +18,25 @@ import (
 	"github.com/qiffang/mnemos/server/internal/llm"
 	"github.com/qiffang/mnemos/server/internal/middleware"
 	"github.com/qiffang/mnemos/server/internal/repository"
-	"github.com/qiffang/mnemos/server/internal/repository/tidb"
 	"github.com/qiffang/mnemos/server/internal/service"
 )
 
+// MemoryRepoFactory creates a MemoryRepo for a given *sql.DB.
+type MemoryRepoFactory func(db *sql.DB, autoModel string, ftsEnabled bool) repository.MemoryRepo
+
 // Server holds the HTTP handlers and their dependencies.
 type Server struct {
-	tenant      *service.TenantService
-	uploadTasks repository.UploadTaskRepo
-	uploadDir   string
-	embedder    *embed.Embedder
-	llmClient   *llm.Client
-	autoModel   string
-	ftsEnabled  bool
-	ingestMode  service.IngestMode
-	logger      *slog.Logger
-	svcCache    sync.Map
+	tenant         *service.TenantService
+	uploadTasks    repository.UploadTaskRepo
+	uploadDir      string
+	embedder       *embed.Embedder
+	llmClient      *llm.Client
+	autoModel      string
+	ftsEnabled     bool
+	ingestMode     service.IngestMode
+	logger         *slog.Logger
+	memRepoFactory MemoryRepoFactory
+	svcCache       sync.Map
 }
 
 // NewServer creates a new HTTP handler server.
@@ -46,17 +50,19 @@ func NewServer(
 	ftsEnabled bool,
 	ingestMode service.IngestMode,
 	logger *slog.Logger,
+	memRepoFactory MemoryRepoFactory,
 ) *Server {
 	return &Server{
-		tenant:      tenantSvc,
-		uploadTasks: uploadTasks,
-		uploadDir:   uploadDir,
-		embedder:    embedder,
-		llmClient:   llmClient,
-		autoModel:   autoModel,
-		ftsEnabled:  ftsEnabled,
-		ingestMode:  ingestMode,
-		logger:      logger,
+		tenant:         tenantSvc,
+		uploadTasks:    uploadTasks,
+		uploadDir:      uploadDir,
+		embedder:       embedder,
+		llmClient:      llmClient,
+		autoModel:      autoModel,
+		ftsEnabled:     ftsEnabled,
+		ingestMode:     ingestMode,
+		logger:         logger,
+		memRepoFactory: memRepoFactory,
 	}
 }
 
@@ -76,7 +82,7 @@ func (s *Server) resolveServices(auth *domain.AuthInfo) resolvedSvc {
 		if cached, ok := s.svcCache.Load(key); ok {
 			return cached.(resolvedSvc)
 		}
-		memRepo := tidb.NewMemoryRepo(auth.TenantDB, s.autoModel, s.ftsEnabled)
+		memRepo := s.memRepoFactory(auth.TenantDB, s.autoModel, s.ftsEnabled)
 		svc := resolvedSvc{
 			memory: service.NewMemoryService(memRepo, s.llmClient, s.embedder, s.autoModel, s.ingestMode),
 			ingest: service.NewIngestService(memRepo, s.llmClient, s.embedder, s.autoModel, s.ingestMode),
@@ -88,7 +94,7 @@ func (s *Server) resolveServices(auth *domain.AuthInfo) resolvedSvc {
 	if cached, ok := s.svcCache.Load(key); ok {
 		return cached.(resolvedSvc)
 	}
-	memRepo := tidb.NewMemoryRepo(auth.TenantDB, s.autoModel, s.ftsEnabled)
+	memRepo := s.memRepoFactory(auth.TenantDB, s.autoModel, s.ftsEnabled)
 	svc := resolvedSvc{
 		memory: service.NewMemoryService(memRepo, s.llmClient, s.embedder, s.autoModel, s.ingestMode),
 		ingest: service.NewIngestService(memRepo, s.llmClient, s.embedder, s.autoModel, s.ingestMode),
