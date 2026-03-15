@@ -13,6 +13,22 @@ export interface PluginConfig {
 
   // Ingest: size-aware message selection for smart pipeline
   maxIngestBytes?: number;
+
+  // Memory Agent
+  memoryAgentId?: string;
+  agentMinSessions?: number;
+  agentMaxSessions?: number;
+  agentMaxRunsPerSession?: number;
+  agentRunTimeoutMs?: number;
+  agentIdleReapMs?: number;
+  modelFallbackChain?: string[];
+}
+
+export interface BulkStoreInput {
+  content: string;
+  tags?: string[];
+  metadata?: Record<string, unknown>;
+  memory_type?: "pinned" | "insight";
 }
 
 export interface Memory {
@@ -53,6 +69,9 @@ export interface UpdateMemoryInput {
   source?: string;
   tags?: string[];
   metadata?: Record<string, unknown>;
+  /** When set, sent as If-Match header to enable server-side conflict detection.
+   *  On 409, the plugin merges current + incoming via LLM and retries. */
+  _version?: number;
 }
 
 export interface SearchInput {

@@ -1,3 +1,10 @@
+/**
+ * ServerBackend — Pure HTTP transport layer.
+ *
+ * Implements MemoryBackend via REST calls to vmem-server.
+ * No intelligence — all smarts live in the Memory Agent (subagent).
+ */
+
 import type { MemoryBackend } from "./backend.js";
 import type {
   Memory,
@@ -8,9 +15,10 @@ import type {
   SearchInput,
   IngestInput,
   IngestResult,
+  BulkStoreInput,
 } from "./types.js";
 
-type ProvisionMem9sResponse = {
+type ProvisionVmemsResponse = {
   id: string;
 };
 
@@ -25,20 +33,20 @@ export class ServerBackend implements MemoryBackend {
     this.agentName = agentName;
   }
 
-  async register(): Promise<ProvisionMem9sResponse> {
-    const resp = await fetch(this.baseUrl + "/v1alpha1/mem9s", {
+  async register(): Promise<ProvisionVmemsResponse> {
+    const resp = await fetch(this.baseUrl + "/v1alpha1/vmems", {
       method: "POST",
       signal: AbortSignal.timeout(8_000),
     });
 
     if (!resp.ok) {
       const body = await resp.text();
-      throw new Error(`mem9s provision failed (${resp.status}): ${body}`);
+      throw new Error(`vmem provision failed (${resp.status}): ${body}`);
     }
 
-    const data = (await resp.json()) as ProvisionMem9sResponse;
+    const data = (await resp.json()) as ProvisionVmemsResponse;
     if (!data?.id) {
-      throw new Error("mem9s provision did not return tenant ID");
+      throw new Error("vmem provision did not return tenant ID");
     }
 
     this.tenantID = data.id;
@@ -49,7 +57,7 @@ export class ServerBackend implements MemoryBackend {
     if (!this.tenantID) {
       throw new Error("tenant ID is not configured");
     }
-    return `/v1alpha1/mem9s/${this.tenantID}${path}`;
+    return `/v1alpha1/vmems/${this.tenantID}${path}`;
   }
 
   async store(input: CreateMemoryInput): Promise<StoreResult> {
@@ -89,7 +97,16 @@ export class ServerBackend implements MemoryBackend {
 
   async update(id: string, input: UpdateMemoryInput): Promise<Memory | null> {
     try {
-      return await this.request<Memory>("PUT", this.tenantPath(`/memories/${id}`), input);
+      const headers: Record<string, string> = {};
+      if (input._version) {
+        headers["If-Match"] = String(input._version);
+      }
+      return await this.requestWithHeaders<Memory>(
+        "PUT",
+        this.tenantPath(`/memories/${id}`),
+        input,
+        headers,
+      );
     } catch {
       return null;
     }
@@ -108,30 +125,57 @@ export class ServerBackend implements MemoryBackend {
     return this.request<IngestResult>("POST", this.tenantPath("/memories"), input);
   }
 
-  private async requestRaw(
+  async bulkStore(items: BulkStoreInput[]): Promise<Memory[]> {
+    const resp = await this.request<{ memories?: Memory[] }>(
+      "POST",
+      this.tenantPath("/memories/bulk"),
+      { memories: items }
+    );
+    return resp.memories ?? [];
+  }
+
+  async gather(facts: string[]): Promise<Memory[]> {
+    const resp = await this.request<{ existing: Memory[] }>(
+      "POST",
+      this.tenantPath("/memories/gather"),
+      { facts },
+    );
+    return resp.existing ?? [];
+  }
+
+  async executeReconcile(
+    events: Array<{ id: string; text: string; event: string; old_memory?: string; tags?: string[] }>,
+    existingIDs: string[],
+  ): Promise<{ memories_changed: number; created_ids?: string[]; warnings: number }> {
+    return this.request<{ memories_changed: number; created_ids?: string[]; warnings: number }>(
+      "POST",
+      this.tenantPath("/memories/execute"),
+      { events, existing_ids: existingIDs },
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // HTTP transport
+  // -------------------------------------------------------------------------
+
+  private async requestWithHeaders<T>(
     method: string,
     path: string,
-    body?: unknown
-  ): Promise<Response> {
+    body?: unknown,
+    extraHeaders?: Record<string, string>,
+  ): Promise<T> {
     const url = this.baseUrl + path;
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
-      "X-Mnemo-Agent-Id": this.agentName,
+      "X-Vmem-Agent-Id": this.agentName,
+      ...extraHeaders,
     };
-    return fetch(url, {
+    const resp = await fetch(url, {
       method,
       headers,
       body: body != null ? JSON.stringify(body) : undefined,
       signal: AbortSignal.timeout(8_000),
     });
-  }
-
-  private async request<T>(
-    method: string,
-    path: string,
-    body?: unknown
-  ): Promise<T> {
-    const resp = await this.requestRaw(method, path, body);
 
     if (resp.status === 204) {
       return undefined as T;
@@ -139,8 +183,18 @@ export class ServerBackend implements MemoryBackend {
 
     const data = await resp.json();
     if (!resp.ok) {
-      throw new Error((data as { error?: string }).error || `HTTP ${resp.status}`);
+      throw new Error(
+        (data as { error?: string }).error || `HTTP ${resp.status}`
+      );
     }
     return data as T;
+  }
+
+  private async request<T>(
+    method: string,
+    path: string,
+    body?: unknown
+  ): Promise<T> {
+    return this.requestWithHeaders<T>(method, path, body);
   }
 }

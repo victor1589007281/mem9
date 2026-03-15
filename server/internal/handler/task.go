@@ -46,7 +46,7 @@ type taskListResponse struct {
 // --- Handlers ---
 
 // createTask accepts a file upload and enqueues it for async ingest.
-// POST /v1alpha1/mem9s/{tenantID}/imports
+// POST /v1alpha1/vmems/{tenantID}/imports
 func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 	// Limit request body size BEFORE ParseMultipartForm to prevent large temp file creation.
 	// This closes the body after maxUploadSize bytes, causing ParseMultipartForm to fail early.
@@ -180,7 +180,7 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 }
 
 // listTasks returns all tasks for a tenant with an aggregate status.
-// GET /v1alpha1/mem9s/{tenantID}/imports
+// GET /v1alpha1/vmems/{tenantID}/imports
 func (s *Server) listTasks(w http.ResponseWriter, r *http.Request) {
 	auth := authInfo(r)
 	tasks, err := s.uploadTasks.ListByTenant(r.Context(), auth.TenantID)
@@ -222,7 +222,7 @@ func (s *Server) listTasks(w http.ResponseWriter, r *http.Request) {
 }
 
 // getTask returns a single task by ID.
-// GET /v1alpha1/mem9s/{tenantID}/imports/{id}
+// GET /v1alpha1/vmems/{tenantID}/imports/{id}
 func (s *Server) getTask(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	if id == "" {

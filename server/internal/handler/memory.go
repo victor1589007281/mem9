@@ -20,7 +20,6 @@ type createMemoryRequest struct {
 	Metadata  json.RawMessage         `json:"metadata,omitempty"`
 	Messages  []service.IngestMessage `json:"messages,omitempty"`
 	SessionID string                  `json:"session_id,omitempty"`
-	Mode      service.IngestMode      `json:"mode,omitempty"`
 }
 
 func (s *Server) createMemory(w http.ResponseWriter, r *http.Request) {
@@ -52,7 +51,6 @@ func (s *Server) createMemory(w http.ResponseWriter, r *http.Request) {
 			Messages:  messages,
 			SessionID: req.SessionID,
 			AgentID:   agentID,
-			Mode:      req.Mode,
 		}
 
 		go func(agentName string, req service.IngestRequest) {
@@ -70,10 +68,6 @@ func (s *Server) createMemory(w http.ResponseWriter, r *http.Request) {
 
 	if !hasContent {
 		s.handleError(w, &domain.ValidationError{Field: "content", Message: "content or messages required"})
-		return
-	}
-	if req.Mode != "" {
-		s.handleError(w, &domain.ValidationError{Field: "body", Message: "content mode does not accept mode"})
 		return
 	}
 
@@ -234,6 +228,48 @@ func (s *Server) bulkCreateMemories(w http.ResponseWriter, r *http.Request) {
 		"ok":       true,
 		"memories": memories,
 	})
+}
+
+// gatherMemories searches existing memories relevant to a set of facts
+// using parallel goroutines. Called by plugin after LLM fact extraction.
+func (s *Server) gatherMemories(w http.ResponseWriter, r *http.Request) {
+	var req service.GatherRequest
+	if err := decode(r, &req); err != nil {
+		s.handleError(w, err)
+		return
+	}
+
+	auth := authInfo(r)
+	svc := s.resolveServices(auth)
+
+	result, err := svc.memory.Gather(r.Context(), req)
+	if err != nil {
+		s.handleError(w, err)
+		return
+	}
+
+	respond(w, http.StatusOK, result)
+}
+
+// executeReconcile applies reconcile events (ADD/UPDATE/DELETE) in parallel.
+// Called by plugin after LLM reconciliation.
+func (s *Server) executeReconcile(w http.ResponseWriter, r *http.Request) {
+	var req service.ExecuteRequest
+	if err := decode(r, &req); err != nil {
+		s.handleError(w, err)
+		return
+	}
+
+	auth := authInfo(r)
+	svc := s.resolveServices(auth)
+
+	result, err := svc.memory.Execute(r.Context(), auth.AgentName, req)
+	if err != nil {
+		s.handleError(w, err)
+		return
+	}
+
+	respond(w, http.StatusOK, result)
 }
 
 func (s *Server) bootstrapMemories(w http.ResponseWriter, r *http.Request) {

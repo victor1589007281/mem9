@@ -13,7 +13,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/qiffang/mnemos/server/internal/domain"
 	"github.com/qiffang/mnemos/server/internal/embed"
-	"github.com/qiffang/mnemos/server/internal/llm"
 	"github.com/qiffang/mnemos/server/internal/repository"
 )
 
@@ -31,12 +30,12 @@ type MemoryService struct {
 	ingest    *IngestService
 }
 
-func NewMemoryService(memories repository.MemoryRepo, llmClient *llm.Client, embedder *embed.Embedder, autoModel string, ingestMode IngestMode) *MemoryService {
+func NewMemoryService(memories repository.MemoryRepo, embedder *embed.Embedder, autoModel string) *MemoryService {
 	return &MemoryService{
 		memories:  memories,
 		embedder:  embedder,
 		autoModel: autoModel,
-		ingest:    NewIngestService(memories, llmClient, embedder, autoModel, ingestMode),
+		ingest:    NewIngestService(memories, embedder, autoModel),
 	}
 }
 
@@ -45,46 +44,34 @@ func (s *MemoryService) Create(ctx context.Context, agentID, content string, tag
 		return nil, err
 	}
 
-	if s.ingest == nil || !s.ingest.HasLLM() {
-		return nil, &domain.ValidationError{Field: "llm", Message: "LLM is required for content reconciliation"}
+	var embedding []float32
+	if s.autoModel == "" && s.embedder != nil {
+		var err error
+		embedding, err = s.embedder.Embed(ctx, content)
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	result, err := s.ingest.ReconcileContent(ctx, agentID, agentID, "", []string{content})
-	if err != nil {
+	now := time.Now()
+	mem := &domain.Memory{
+		ID:         uuid.New().String(),
+		Content:    content,
+		Source:     agentID,
+		Tags:       tags,
+		Metadata:   metadata,
+		Embedding:  embedding,
+		MemoryType: domain.TypePinned,
+		State:      domain.StateActive,
+		Version:    1,
+		UpdatedBy:  agentID,
+		CreatedAt:  now,
+		UpdatedAt:  now,
+	}
+	if err := s.memories.Create(ctx, mem); err != nil {
 		return nil, err
 	}
-
-	if result.Status == "failed" {
-		return nil, fmt.Errorf("content reconciliation failed")
-	}
-	if len(result.InsightIDs) == 0 {
-		return nil, nil
-	}
-
-	// Apply user-provided tags/metadata to all created insights.
-	for _, id := range result.InsightIDs {
-		mem, err := s.memories.GetByID(ctx, id)
-		if err != nil {
-			continue
-		}
-		if len(tags) > 0 {
-			mem.Tags = tags
-		}
-		if len(metadata) > 0 {
-			mem.Metadata = metadata
-		}
-		if len(tags) > 0 || len(metadata) > 0 {
-			_ = s.memories.UpdateOptimistic(ctx, mem, 0)
-		}
-	}
-
-	latestID := result.InsightIDs[len(result.InsightIDs)-1]
-	mem, getErr := s.memories.GetByID(ctx, latestID)
-	if getErr != nil {
-		return nil, fmt.Errorf("fetch reconciled memory %s: %w", latestID, getErr)
-	}
 	return mem, nil
-
 }
 
 // Get returns a single memory by ID.
@@ -349,7 +336,11 @@ func applyTypeWeights(mems map[string]domain.Memory, scores map[string]float64) 
 	}
 }
 
-// Update modifies an existing memory with LWW conflict resolution.
+// Update modifies an existing memory.
+// When If-Match is provided and doesn't match the current version, returns a
+// VersionConflictError containing the current memory so the client (plugin)
+// can perform LLM-based merge and retry.
+// When If-Match is 0 (not provided), falls back to LWW (last writer wins).
 func (s *MemoryService) Update(ctx context.Context, agentName, id, content string, tags []string, metadata json.RawMessage, ifMatch int) (*domain.Memory, error) {
 	current, err := s.memories.GetByID(ctx, id)
 	if err != nil {
@@ -357,12 +348,17 @@ func (s *MemoryService) Update(ctx context.Context, agentName, id, content strin
 	}
 
 	if ifMatch > 0 && ifMatch != current.Version {
-		slog.Warn("version conflict, applying LWW",
+		slog.Warn("version conflict detected",
 			"memory_id", id,
 			"expected_version", ifMatch,
 			"actual_version", current.Version,
 			"agent", agentName,
 		)
+		return nil, &domain.VersionConflictError{
+			Current:         current,
+			ExpectedVersion: ifMatch,
+			ActualVersion:   current.Version,
+		}
 	}
 
 	contentChanged := false
@@ -419,6 +415,7 @@ func (s *MemoryService) Bootstrap(ctx context.Context, limit int) ([]domain.Memo
 }
 
 // BulkCreate creates multiple memories at once.
+// Uses batch embedding when available to reduce API calls.
 func (s *MemoryService) BulkCreate(ctx context.Context, agentName string, items []BulkMemoryInput) ([]domain.Memory, error) {
 	if len(items) == 0 {
 		return nil, &domain.ValidationError{Field: "memories", Message: "required"}
@@ -429,6 +426,8 @@ func (s *MemoryService) BulkCreate(ctx context.Context, agentName string, items 
 
 	now := time.Now()
 	memories := make([]*domain.Memory, 0, len(items))
+	var contents []string
+
 	for i, item := range items {
 		if err := validateMemoryInput(item.Content, item.Tags); err != nil {
 			var ve *domain.ValidationError
@@ -438,13 +437,14 @@ func (s *MemoryService) BulkCreate(ctx context.Context, agentName string, items 
 			return nil, err
 		}
 
-		var embedding []float32
-		if s.autoModel == "" && s.embedder != nil {
-			var err error
-			embedding, err = s.embedder.Embed(ctx, item.Content)
-			if err != nil {
-				return nil, err
-			}
+		memType := domain.TypePinned
+		switch item.MemoryType {
+		case "insight":
+			memType = domain.TypeInsight
+		case "pinned", "":
+			memType = domain.TypePinned
+		default:
+			return nil, &domain.ValidationError{Field: "memories[" + strconv.Itoa(i) + "].memory_type", Message: "must be pinned or insight"}
 		}
 
 		memories = append(memories, &domain.Memory{
@@ -453,14 +453,24 @@ func (s *MemoryService) BulkCreate(ctx context.Context, agentName string, items 
 			Source:     agentName,
 			Tags:       item.Tags,
 			Metadata:   item.Metadata,
-			Embedding:  embedding,
-			MemoryType: domain.TypePinned,
+			MemoryType: memType,
 			State:      domain.StateActive,
 			Version:    1,
 			UpdatedBy:  agentName,
 			CreatedAt:  now,
 			UpdatedAt:  now,
 		})
+		contents = append(contents, item.Content)
+	}
+
+	if s.autoModel == "" && s.embedder != nil {
+		embeddings, err := s.embedder.EmbedBatch(ctx, contents)
+		if err != nil {
+			return nil, err
+		}
+		for i, emb := range embeddings {
+			memories[i].Embedding = emb
+		}
 	}
 
 	if err := s.memories.BulkCreate(ctx, memories); err != nil {
@@ -476,9 +486,10 @@ func (s *MemoryService) BulkCreate(ctx context.Context, agentName string, items 
 
 // BulkMemoryInput is the input shape for each item in a bulk create request.
 type BulkMemoryInput struct {
-	Content  string          `json:"content"`
-	Tags     []string        `json:"tags,omitempty"`
-	Metadata json.RawMessage `json:"metadata,omitempty"`
+	Content    string          `json:"content"`
+	Tags       []string        `json:"tags,omitempty"`
+	Metadata   json.RawMessage `json:"metadata,omitempty"`
+	MemoryType string          `json:"memory_type,omitempty"` // "pinned" (default) or "insight"
 }
 
 func validateMemoryInput(content string, tags []string) error {

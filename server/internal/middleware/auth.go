@@ -16,7 +16,7 @@ type contextKey string
 
 const authInfoKey contextKey = "authInfo"
 
-const AgentIDHeader = "X-Mnemo-Agent-Id"
+const AgentIDHeader = "X-Vmem-Agent-Id"
 
 // ResolveTenant is middleware that extracts {tenantID} from the URL path,
 // validates the tenant exists and is active, obtains a DB connection from the

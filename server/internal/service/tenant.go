@@ -98,7 +98,7 @@ func (s *TenantService) Provision(ctx context.Context) (*ProvisionResult, error)
 		return nil, &domain.ValidationError{Message: "provisioning disabled (TiDB Zero not configured)"}
 	}
 
-	instance, err := s.zero.CreateInstance(ctx, "mem9s")
+	instance, err := s.zero.CreateInstance(ctx, "vmems")
 	if err != nil {
 		return nil, fmt.Errorf("provision TiDB Zero instance: %w", err)
 	}

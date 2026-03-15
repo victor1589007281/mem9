@@ -8,7 +8,7 @@ type provisionResponse struct {
 	ID string `json:"id"`
 }
 
-func (s *Server) provisionMem9s(w http.ResponseWriter, r *http.Request) {
+func (s *Server) provisionVmems(w http.ResponseWriter, r *http.Request) {
 	result, err := s.tenant.Provision(r.Context())
 	if err != nil {
 		s.handleError(w, err)

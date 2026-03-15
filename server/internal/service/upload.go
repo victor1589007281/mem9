@@ -15,7 +15,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/qiffang/mnemos/server/internal/domain"
 	"github.com/qiffang/mnemos/server/internal/embed"
-	"github.com/qiffang/mnemos/server/internal/llm"
 	"github.com/qiffang/mnemos/server/internal/repository"
 	"github.com/qiffang/mnemos/server/internal/repository/tidb"
 	"github.com/qiffang/mnemos/server/internal/tenant"
@@ -53,10 +52,8 @@ type UploadWorker struct {
 	tenants      repository.TenantRepo
 	pool         *tenant.TenantPool
 	embedder     *embed.Embedder
-	llmClient    *llm.Client
 	autoModel    string
 	ftsEnabled   bool
-	mode         IngestMode
 	logger       *slog.Logger
 	pollInterval time.Duration
 	concurrency  int
@@ -68,10 +65,8 @@ func NewUploadWorker(
 	tenants repository.TenantRepo,
 	pool *tenant.TenantPool,
 	embedder *embed.Embedder,
-	llmClient *llm.Client,
 	autoModel string,
 	ftsEnabled bool,
-	mode IngestMode,
 	logger *slog.Logger,
 	concurrency int,
 ) *UploadWorker {
@@ -86,10 +81,8 @@ func NewUploadWorker(
 		tenants:      tenants,
 		pool:         pool,
 		embedder:     embedder,
-		llmClient:    llmClient,
 		autoModel:    autoModel,
 		ftsEnabled:   ftsEnabled,
-		mode:         mode,
 		logger:       logger,
 		pollInterval: 5 * time.Second,
 		concurrency:  concurrency,
@@ -168,7 +161,7 @@ func (w *UploadWorker) processTask(ctx context.Context, task domain.UploadTask) 
 	}
 
 	memRepo := tidb.NewMemoryRepo(db, w.autoModel, w.ftsEnabled)
-	ingestSvc := NewIngestService(memRepo, w.llmClient, w.embedder, w.autoModel, w.mode)
+	ingestSvc := NewIngestService(memRepo, w.embedder, w.autoModel)
 
 	data, err := os.ReadFile(task.FilePath)
 	if err != nil {
@@ -232,7 +225,6 @@ func (w *UploadWorker) processTask(ctx context.Context, task domain.UploadTask) 
 				AgentID:   file.AgentID,
 				SessionID: file.SessionID,
 				Messages:  chunk,
-				Mode:      w.mode,
 			})
 			if err != nil {
 				return w.failTask(ctx, task, fmt.Errorf("ingest session chunk: %w", err), logger)

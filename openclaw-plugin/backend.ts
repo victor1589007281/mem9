@@ -7,10 +7,15 @@ import type {
   SearchInput,
   IngestInput,
   IngestResult,
+  BulkStoreInput,
 } from "./types.js";
+import type { ReconcileEvent } from "./memory-agent.js";
 
 /**
- * MemoryBackend — the abstraction that tools and hooks call through.
+ * MemoryBackend — pure data transport interface.
+ *
+ * Implementations (e.g. ServerBackend) handle HTTP communication only.
+ * All LLM intelligence lives in MemoryAgent, not here.
  */
 export interface MemoryBackend {
   store(input: CreateMemoryInput): Promise<StoreResult>;
@@ -19,9 +24,15 @@ export interface MemoryBackend {
   update(id: string, input: UpdateMemoryInput): Promise<Memory | null>;
   remove(id: string): Promise<boolean>;
 
-  /**
-   * Ingest messages into the smart memory pipeline.
-   * POST /v1alpha1/mem9s/{tenantID}/memories (messages body) → LLM extraction + reconciliation.
-   */
   ingest(input: IngestInput): Promise<IngestResult>;
+  bulkStore(items: BulkStoreInput[]): Promise<Memory[]>;
+
+  /** Server-side parallel gather: search existing memories for facts. */
+  gather(facts: string[]): Promise<Memory[]>;
+
+  /** Server-side parallel execute: apply reconcile events. */
+  executeReconcile(
+    events: ReconcileEvent[],
+    existingIDs: string[],
+  ): Promise<{ memories_changed: number; created_ids?: string[]; warnings: number }>;
 }

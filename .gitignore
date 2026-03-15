@@ -34,3 +34,21 @@ dist/
 # Claude Code
 .claude/
 __pycache__/
+
+# Test artifacts
+*.db
+*.sqlite
+*.sqlite3
+coverage/
+*.cover
+*.coverprofile
+*.prof
+
+# Upload working directory
+uploads/
+
+# Logs
+*.log
+
+# Build output
+mnemo-server

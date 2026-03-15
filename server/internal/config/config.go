@@ -26,11 +26,8 @@ type Config struct {
 	EmbedModel   string
 	EmbedDims    int
 
-	LLMAPIKey      string
-	LLMBaseURL     string
-	LLMModel       string
-	LLMTemperature float64
-	IngestMode     string
+	// LLM is handled exclusively by the plugin (e.g. OpenClaw).
+	// Server runs in raw-ingest mode only; no MNEMO_LLM_* vars.
 
 	TiDBZeroEnabled       bool
 	TiDBZeroAPIURL        string
@@ -72,11 +69,6 @@ func Load() (*Config, error) {
 		EmbedBaseURL:          os.Getenv("MNEMO_EMBED_BASE_URL"),
 		EmbedModel:            os.Getenv("MNEMO_EMBED_MODEL"),
 		EmbedDims:             envInt("MNEMO_EMBED_DIMS", 1536),
-		LLMAPIKey:             os.Getenv("MNEMO_LLM_API_KEY"),
-		LLMBaseURL:            os.Getenv("MNEMO_LLM_BASE_URL"),
-		LLMModel:              envOr("MNEMO_LLM_MODEL", "gpt-4o-mini"),
-		LLMTemperature:        envFloat("MNEMO_LLM_TEMPERATURE", 0.1),
-		IngestMode:            envOr("MNEMO_INGEST_MODE", "smart"),
 		TiDBZeroEnabled:       envBool("MNEMO_TIDB_ZERO_ENABLED", true),
 		TiDBZeroAPIURL:        envOr("MNEMO_TIDB_ZERO_API_URL", "https://zero.tidbapi.com/v1alpha1"),
 		TenantPoolMaxIdle:     envInt("MNEMO_TENANT_POOL_MAX_IDLE", 5),
@@ -93,14 +85,6 @@ func Load() (*Config, error) {
 		// ok
 	default:
 		return nil, fmt.Errorf("unsupported MNEMO_DB_DRIVER %q; valid values are \"mysql\", \"postgres\", \"sqlite\"", cfg.DBDriver)
-	}
-
-	// Validate ingest mode.
-	switch cfg.IngestMode {
-	case "smart", "raw", "":
-		// ok
-	default:
-		return nil, fmt.Errorf("unsupported MNEMO_INGEST_MODE %q; valid values are \"smart\" and \"raw\"", cfg.IngestMode)
 	}
 
 	return cfg, nil

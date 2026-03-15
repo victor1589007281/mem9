@@ -2,15 +2,10 @@ package service
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"testing"
 
 	"github.com/qiffang/mnemos/server/internal/domain"
-	"github.com/qiffang/mnemos/server/internal/llm"
 )
 
 type memoryRepoMock struct {
@@ -304,37 +299,10 @@ func TestFormatConversation(t *testing.T) {
 	}
 }
 
-func TestParseIntID(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name     string
-		input    string
-		expected int
-	}{
-		{name: "valid integer", input: "42", expected: 42},
-		{name: "negative integer", input: "-7", expected: -7},
-		{name: "invalid string", input: "abc", expected: -1},
-		{name: "empty string", input: "", expected: -1},
-		{name: "trailing text", input: "12x", expected: -1},
-	}
-
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			got := parseIntID(tt.input)
-			if got != tt.expected {
-				t.Fatalf("parseIntID() = %d, expected %d", got, tt.expected)
-			}
-		})
-	}
-}
-
 func TestIngestEmptyMessages(t *testing.T) {
 	t.Parallel()
 
-	svc := NewIngestService(&memoryRepoMock{}, nil, nil, "", ModeSmart)
+	svc := NewIngestService(&memoryRepoMock{}, nil, "")
 	_, err := svc.Ingest(context.Background(), "agent-1", IngestRequest{})
 	if err == nil {
 		t.Fatalf("expected validation error")
@@ -352,10 +320,9 @@ func TestIngestModeRawStoresInsight(t *testing.T) {
 	t.Parallel()
 
 	memRepo := &memoryRepoMock{}
-	svc := NewIngestService(memRepo, nil, nil, "", ModeSmart)
+	svc := NewIngestService(memRepo, nil, "")
 
 	req := IngestRequest{
-		Mode:      ModeRaw,
 		SessionID: "session-1",
 		AgentID:   "agent-1",
 		Messages: []IngestMessage{{
@@ -388,14 +355,13 @@ func TestIngestModeRawStoresInsight(t *testing.T) {
 	}
 }
 
-func TestIngestNilLLMFallsBackToRaw(t *testing.T) {
+func TestIngestAlwaysRaw(t *testing.T) {
 	t.Parallel()
 
 	memRepo := &memoryRepoMock{}
-	svc := NewIngestService(memRepo, nil, nil, "", ModeSmart)
+	svc := NewIngestService(memRepo, nil, "")
 
 	req := IngestRequest{
-		Mode:      ModeSmart,
 		SessionID: "session-2",
 		AgentID:   "agent-2",
 		Messages: []IngestMessage{{
@@ -413,163 +379,6 @@ func TestIngestNilLLMFallsBackToRaw(t *testing.T) {
 	}
 	if len(memRepo.createCalls) != 1 {
 		t.Fatalf("expected 1 Create call, got %d", len(memRepo.createCalls))
-	}
-}
-
-// TestReconcileDeleteErrNotFoundIsNotWarning verifies the DELETE path in reconcile()
-// silently skips ErrNotFound (e.g., row already archived by a concurrent operation)
-// without counting it as a warning. Uses a mock LLM server to exercise the full path.
-func TestReconcileDeleteErrNotFoundIsNotWarning(t *testing.T) {
-	t.Parallel()
-
-	// Mock LLM: first call returns extraction with one fact, second returns DELETE action.
-	callCount := 0
-	mockLLM := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		callCount++
-		var resp string
-		if callCount == 1 {
-			// extractFacts response.
-			resp = `{"facts": ["user prefers dark mode"]}`
-		} else {
-			// reconcile response — DELETE the existing memory.
-			resp = `{"memory": [{"id": "0", "text": "user prefers dark mode", "event": "DELETE"}]}`
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
-			"choices": []map[string]any{
-				{"message": map[string]string{"content": resp}},
-			},
-		})
-	}))
-	defer mockLLM.Close()
-
-	llmClient := llm.New(llm.Config{
-		APIKey:  "test-key",
-		BaseURL: mockLLM.URL,
-		Model:   "test-model",
-	})
-
-	// Repository: SetState returns ErrNotFound (simulating already-archived row).
-	// AutoVectorSearch returns an existing memory so reconcile has something to DELETE.
-	memRepo := &memoryRepoMock{
-		setStateErr: domain.ErrNotFound,
-		vectorResults: []domain.Memory{
-			{ID: "mem-123", Content: "user prefers dark mode", MemoryType: domain.TypeInsight, State: domain.StateActive},
-		},
-	}
-
-	svc := NewIngestService(memRepo, llmClient, nil, "auto-model", ModeSmart)
-
-	res, err := svc.Ingest(context.Background(), "agent-1", IngestRequest{
-		Mode:      ModeSmart,
-		SessionID: "sess-1",
-		AgentID:   "agent-1",
-		Messages: []IngestMessage{
-			{Role: "user", Content: "I prefer dark mode"},
-			{Role: "assistant", Content: "Noted, dark mode preference saved."},
-		},
-	})
-	if err != nil {
-		t.Fatalf("Ingest() error = %v", err)
-	}
-	if res == nil {
-		t.Fatal("expected non-nil result")
-	}
-
-	// ErrNotFound from SetState should NOT count as a warning.
-	if res.Warnings != 0 {
-		t.Fatalf("expected 0 warnings for ErrNotFound, got %d", res.Warnings)
-	}
-
-	// Verify SetState was actually called with the correct ID and state.
-	if len(memRepo.setStateCalls) != 1 {
-		t.Fatalf("expected 1 SetState call, got %d", len(memRepo.setStateCalls))
-	}
-	if memRepo.setStateCalls[0].ID != "mem-123" {
-		t.Fatalf("expected SetState on mem-123, got %q", memRepo.setStateCalls[0].ID)
-	}
-	if memRepo.setStateCalls[0].State != domain.StateDeleted {
-		t.Fatalf("expected StateDeleted, got %q", memRepo.setStateCalls[0].State)
-	}
-}
-
-// TestReconcileDeleteRealErrorCountsAsWarning verifies that a real database error
-// (not ErrNotFound) during DELETE IS counted as a warning.
-func TestReconcileDeleteRealErrorCountsAsWarning(t *testing.T) {
-	t.Parallel()
-
-	callCount := 0
-	mockLLM := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		callCount++
-		var resp string
-		if callCount == 1 {
-			resp = `{"facts": ["user prefers dark mode"]}`
-		} else {
-			resp = `{"memory": [{"id": "0", "text": "user prefers dark mode", "event": "DELETE"}]}`
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
-			"choices": []map[string]any{
-				{"message": map[string]string{"content": resp}},
-			},
-		})
-	}))
-	defer mockLLM.Close()
-
-	llmClient := llm.New(llm.Config{
-		APIKey:  "test-key",
-		BaseURL: mockLLM.URL,
-		Model:   "test-model",
-	})
-
-	memRepo := &memoryRepoMock{
-		setStateErr: fmt.Errorf("database connection lost"),
-		vectorResults: []domain.Memory{
-			{ID: "mem-456", Content: "user prefers dark mode", MemoryType: domain.TypeInsight, State: domain.StateActive},
-		},
-	}
-
-	svc := NewIngestService(memRepo, llmClient, nil, "auto-model", ModeSmart)
-
-	res, err := svc.Ingest(context.Background(), "agent-1", IngestRequest{
-		Mode:      ModeSmart,
-		SessionID: "sess-2",
-		AgentID:   "agent-1",
-		Messages: []IngestMessage{
-			{Role: "user", Content: "I prefer dark mode"},
-			{Role: "assistant", Content: "Noted."},
-		},
-	})
-	if err != nil {
-		t.Fatalf("Ingest() error = %v", err)
-	}
-	if res == nil {
-		t.Fatal("expected non-nil result")
-	}
-
-	// Real error from SetState SHOULD count as a warning.
-	if res.Warnings != 1 {
-		t.Fatalf("expected 1 warning for real error, got %d", res.Warnings)
-	}
-}
-
-func TestIngestInvalidModeReturnsValidationError(t *testing.T) {
-	t.Parallel()
-
-	svc := NewIngestService(&memoryRepoMock{}, nil, nil, "", ModeSmart)
-	_, err := svc.Ingest(context.Background(), "agent-1", IngestRequest{
-		Mode:     IngestMode("unknown"),
-		Messages: []IngestMessage{{Role: "user", Content: "hello"}},
-	})
-	if err == nil {
-		t.Fatal("expected validation error for invalid mode")
-	}
-	var vErr *domain.ValidationError
-	if !errors.As(err, &vErr) {
-		t.Fatalf("expected ValidationError, got %T: %v", err, err)
-	}
-	if vErr.Field != "mode" {
-		t.Fatalf("expected field 'mode', got %q", vErr.Field)
 	}
 }
 
@@ -601,294 +410,5 @@ func TestTruncateRunes(t *testing.T) {
 				t.Fatalf("truncateRunes(%q, %d) = %q, expected %q", tt.input, tt.max, got, tt.expected)
 			}
 		})
-	}
-}
-
-// TestReconcileFallbackWritesNothing verifies that when the LLM fails during
-// reconciliation (with existing memories present), the system writes nothing
-// instead of blindly adding all facts as duplicates.
-func TestReconcileFallbackWritesNothing(t *testing.T) {
-	t.Parallel()
-
-	// Mock LLM: first call (extractFacts) succeeds, second call (reconcile) fails with 500.
-	callCount := 0
-	mockLLM := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		callCount++
-		if callCount == 1 {
-			// extractFacts response.
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]any{
-				"choices": []map[string]any{
-					{"message": map[string]string{"content": `{"facts": ["user prefers dark mode"]}`}},
-				},
-			})
-			return
-		}
-		// All subsequent calls fail (reconcile + retry).
-		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte(`{"error": "service unavailable"}`))
-	}))
-	defer mockLLM.Close()
-
-	llmClient := llm.New(llm.Config{
-		APIKey:  "test-key",
-		BaseURL: mockLLM.URL,
-		Model:   "test-model",
-	})
-
-	// Repo has existing memories so reconcile path is taken (not addAllFacts bypass).
-	memRepo := &memoryRepoMock{
-		vectorResults: []domain.Memory{
-			{ID: "mem-existing", Content: "user prefers light mode", MemoryType: domain.TypeInsight, State: domain.StateActive},
-		},
-	}
-
-	svc := NewIngestService(memRepo, llmClient, nil, "auto-model", ModeSmart)
-
-	res, err := svc.Ingest(context.Background(), "agent-1", IngestRequest{
-		Mode:      ModeSmart,
-		SessionID: "sess-fallback",
-		AgentID:   "agent-1",
-		Messages: []IngestMessage{
-			{Role: "user", Content: "I prefer dark mode"},
-			{Role: "assistant", Content: "Noted."},
-		},
-	})
-	if err != nil {
-		t.Fatalf("Ingest() error = %v", err)
-	}
-	if res == nil {
-		t.Fatal("expected non-nil result")
-	}
-
-	// With the safer fallback, nothing should be written on LLM failure.
-	if res.MemoriesChanged != 0 {
-		t.Fatalf("expected 0 memories changed (safe fallback), got %d", res.MemoriesChanged)
-	}
-	// No Create calls should have been made.
-	if len(memRepo.createCalls) != 0 {
-		t.Fatalf("expected 0 Create calls (safe fallback), got %d", len(memRepo.createCalls))
-	}
-	// LLM failure should produce warnings=1 and status="partial" so callers
-	// can distinguish "nothing to remember" from "reconciliation failed."
-	if res.Warnings != 1 {
-		t.Fatalf("expected 1 warning for reconciliation LLM failure, got %d", res.Warnings)
-	}
-	if res.Status != "partial" {
-		t.Fatalf("expected status 'partial' for reconciliation LLM failure, got %q", res.Status)
-	}
-}
-
-// TestGatherExistingMemoriesFiltersLowScoreVectorResults verifies that vector
-// search results with scores below the minimum threshold are excluded from the
-// gathered memories, preventing low-relevance candidates from wasting LLM context.
-func TestGatherExistingMemoriesFiltersLowScoreVectorResults(t *testing.T) {
-	t.Parallel()
-
-	// Pin scores close to the 0.3 boundary to catch accidental threshold changes.
-	highScore := 0.31
-	lowScore := 0.29
-
-	memRepo := &memoryRepoMock{
-		vectorResults: []domain.Memory{
-			{ID: "high-relevance", Content: "relevant memory", MemoryType: domain.TypeInsight, State: domain.StateActive, Score: &highScore},
-			{ID: "low-relevance", Content: "unrelated memory", MemoryType: domain.TypeInsight, State: domain.StateActive, Score: &lowScore},
-		},
-	}
-
-	svc := NewIngestService(memRepo, nil, nil, "auto-model", ModeSmart)
-
-	result, err := svc.gatherExistingMemories(context.Background(), "agent-1", []string{"test fact"})
-	if err != nil {
-		t.Fatalf("gatherExistingMemories() error = %v", err)
-	}
-
-	// Only the high-score result should be included.
-	if len(result) != 1 {
-		t.Fatalf("expected 1 memory (filtered by threshold), got %d", len(result))
-	}
-	if result[0].ID != "high-relevance" {
-		t.Fatalf("expected high-relevance memory, got %s", result[0].ID)
-	}
-}
-
-// TestGatherExistingMemoriesFTSOnlyMode verifies that when no embedder and no
-// autoModel are configured but FTS is available, gatherExistingMemories runs
-// per-fact FTS search instead of falling back to List().
-func TestGatherExistingMemoriesFTSOnlyMode(t *testing.T) {
-	t.Parallel()
-
-	memRepo := &memoryRepoMock{
-		ftsAvail: true,
-		ftsResults: []domain.Memory{
-			{ID: "fts-1", Content: "user likes Go", MemoryType: domain.TypeInsight, State: domain.StateActive},
-			{ID: "fts-2", Content: "user uses TiDB", MemoryType: domain.TypeInsight, State: domain.StateActive},
-		},
-	}
-
-	// No embedder, no autoModel — FTS-only deployment.
-	svc := NewIngestService(memRepo, nil, nil, "", ModeSmart)
-
-	result, err := svc.gatherExistingMemories(context.Background(), "agent-1", []string{"Go programming", "TiDB database"})
-	if err != nil {
-		t.Fatalf("gatherExistingMemories() error = %v", err)
-	}
-
-	// FTS results should appear (2 unique memories, returned for both facts but deduped).
-	if len(result) != 2 {
-		t.Fatalf("expected 2 memories from FTS-only mode, got %d", len(result))
-	}
-	// Verify both FTS results are present.
-	ids := map[string]bool{}
-	for _, m := range result {
-		ids[m.ID] = true
-	}
-	if !ids["fts-1"] || !ids["fts-2"] {
-		t.Fatalf("expected fts-1 and fts-2, got %v", ids)
-	}
-}
-
-// TestGatherExistingMemoriesHybridDedup verifies that overlapping vector and
-// FTS results are deduplicated (same ID appears only once).
-func TestGatherExistingMemoriesHybridDedup(t *testing.T) {
-	t.Parallel()
-
-	highScore := 0.8
-	memRepo := &memoryRepoMock{
-		ftsAvail: true,
-		vectorResults: []domain.Memory{
-			{ID: "shared-1", Content: "user prefers dark mode", MemoryType: domain.TypeInsight, State: domain.StateActive, Score: &highScore},
-			{ID: "vec-only", Content: "user is a backend engineer", MemoryType: domain.TypeInsight, State: domain.StateActive, Score: &highScore},
-		},
-		ftsResults: []domain.Memory{
-			{ID: "shared-1", Content: "user prefers dark mode", MemoryType: domain.TypeInsight, State: domain.StateActive},
-			{ID: "fts-only", Content: "uses Go 1.22", MemoryType: domain.TypeInsight, State: domain.StateActive},
-		},
-	}
-
-	svc := NewIngestService(memRepo, nil, nil, "auto-model", ModeSmart)
-
-	result, err := svc.gatherExistingMemories(context.Background(), "agent-1", []string{"dark mode preference"})
-	if err != nil {
-		t.Fatalf("gatherExistingMemories() error = %v", err)
-	}
-
-	// shared-1 should appear once (deduped), vec-only and fts-only each once = 3 total.
-	if len(result) != 3 {
-		t.Fatalf("expected 3 deduplicated memories, got %d", len(result))
-	}
-	ids := map[string]bool{}
-	for _, m := range result {
-		ids[m.ID] = true
-	}
-	if !ids["shared-1"] || !ids["vec-only"] || !ids["fts-only"] {
-		t.Fatalf("expected shared-1, vec-only, fts-only; got %v", ids)
-	}
-}
-
-// TestGatherExistingMemoriesTotalOutageReturnsError verifies that when every
-// single search attempt fails (total outage), gatherExistingMemories returns
-// an error instead of silently returning an empty list (which would cause
-// addAllFacts to create duplicate memories).
-func TestGatherExistingMemoriesTotalOutageReturnsError(t *testing.T) {
-	t.Parallel()
-
-	// All search backends fail.
-	memRepo := &memoryRepoMock{
-		vectorErr: errors.New("connection refused"),
-		kwErr:     errors.New("connection refused"),
-	}
-
-	svc := NewIngestService(memRepo, nil, nil, "auto-model", ModeSmart)
-
-	_, err := svc.gatherExistingMemories(context.Background(), "agent-1", []string{"test fact"})
-	if err == nil {
-		t.Fatal("expected error on total search outage, got nil")
-	}
-	if !errors.Is(err, err) { // sanity check
-		t.Fatalf("unexpected error type: %v", err)
-	}
-}
-
-// TestGatherExistingMemoriesPartialLegFailureContinues verifies that when one
-// search leg fails but the other succeeds, results from the successful leg are
-// returned (no hard abort).
-func TestGatherExistingMemoriesPartialLegFailureContinues(t *testing.T) {
-	t.Parallel()
-
-	highScore := 0.8
-	// Vector succeeds, keyword/FTS fails.
-	memRepo := &memoryRepoMock{
-		vectorResults: []domain.Memory{
-			{ID: "vec-1", Content: "from vector", MemoryType: domain.TypeInsight, State: domain.StateActive, Score: &highScore},
-		},
-		kwErr: errors.New("FTS temporarily unavailable"),
-	}
-
-	svc := NewIngestService(memRepo, nil, nil, "auto-model", ModeSmart)
-
-	result, err := svc.gatherExistingMemories(context.Background(), "agent-1", []string{"test fact"})
-	if err != nil {
-		t.Fatalf("expected partial success, got error: %v", err)
-	}
-	if len(result) != 1 {
-		t.Fatalf("expected 1 memory from vector leg, got %d", len(result))
-	}
-	if result[0].ID != "vec-1" {
-		t.Fatalf("expected vec-1, got %s", result[0].ID)
-	}
-}
-
-// TestGatherExistingMemoriesFTSOnlyTotalOutage verifies the no-vector path
-// also detects total outage when all keyword/FTS searches fail.
-func TestGatherExistingMemoriesFTSOnlyTotalOutage(t *testing.T) {
-	t.Parallel()
-
-	// No vector configured, FTS available but all FTS searches fail.
-	memRepo := &memoryRepoMock{
-		ftsAvail: true,
-		ftsErr:   errors.New("connection refused"),
-	}
-
-	// No embedder, no autoModel — FTS-only deployment.
-	svc := NewIngestService(memRepo, nil, nil, "", ModeSmart)
-
-	_, err := svc.gatherExistingMemories(context.Background(), "agent-1", []string{"test fact"})
-	if err == nil {
-		t.Fatal("expected error on FTS-only total outage, got nil")
-	}
-}
-
-func TestReconcileContentRequiresLLM(t *testing.T) {
-	t.Parallel()
-
-	svc := NewIngestService(&memoryRepoMock{}, nil, nil, "", ModeSmart)
-	_, err := svc.ReconcileContent(context.Background(), "agent", "agent", "", []string{"prefers dark mode"})
-	if err == nil {
-		t.Fatal("expected error when llm is nil")
-	}
-	var ve *domain.ValidationError
-	if !errors.As(err, &ve) {
-		t.Fatalf("expected ValidationError, got %T", err)
-	}
-	if ve.Field != "llm" {
-		t.Fatalf("expected field llm, got %s", ve.Field)
-	}
-}
-
-func TestReconcileContentValidatesInput(t *testing.T) {
-	t.Parallel()
-
-	svc := NewIngestService(&memoryRepoMock{}, nil, nil, "", ModeSmart)
-	_, err := svc.ReconcileContent(context.Background(), "agent", "agent", "", nil)
-	if err == nil {
-		t.Fatal("expected validation error for empty contents")
-	}
-	var ve *domain.ValidationError
-	if !errors.As(err, &ve) {
-		t.Fatalf("expected ValidationError, got %T", err)
-	}
-	if ve.Field != "content" {
-		t.Fatalf("expected field content, got %s", ve.Field)
 	}
 }

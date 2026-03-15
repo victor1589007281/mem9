@@ -1,7 +1,7 @@
 {
-  "name": "@mem9/mem9",
+  "name": "vmem",
   "version": "0.3.3",
-  "description": "OpenClaw shared memory plugin — cloud-persistent memory with hybrid vector + keyword search via mnemo-server",
+  "description": "OpenClaw memory plugin — cloud-persistent memory with hybrid vector + keyword search via vmem-server",
   "type": "module",
   "license": "Apache-2.0",
   "author": "qiffang",

@@ -1,47 +1,38 @@
 /**
- * Lifecycle hooks for the mnemo OpenClaw plugin.
+ * Lifecycle hooks — deterministic orchestration layer.
  *
- * Provides automatic memory recall and capture via OpenClaw's hook system:
- * - before_prompt_build: inject relevant memories into every LLM call
- *   (grouped by type: pinned → insights)
- * - after_compaction: (no-op placeholder for future use)
- * - before_reset: save session context before /reset wipes it
- * - agent_end: auto-capture via smart pipeline with size-aware message selection
+ * The plugin is a RELAY:
+ * - before_prompt_build: inject relevant memories (pure data, no LLM)
+ * - agent_end: start the Memory Agent → agent uses tools to manage memories
  *
- * Reference: OpenClaw's built-in memory-lancedb extension uses the same pattern.
+ * The Memory Agent handles ALL intelligence via its tool-calling loop.
+ * Each tool call is a deterministic server operation.
  */
 
 import type { MemoryBackend } from "./backend.js";
 import type { Memory, IngestMessage } from "./types.js";
+import type { MemoryAgent } from "./memory-agent.js";
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-const MAX_INJECT = 10; // max memories to inject per prompt
-const MIN_PROMPT_LEN = 5; // skip very short prompts
-const AUTO_CAPTURE_SOURCE = "openclaw-auto";
-const MAX_CONTENT_LEN = 500; // truncate individual memory content in prompt
-
-// Ingest defaults — configurable via maxIngestBytes in plugin config
-const DEFAULT_MAX_INGEST_BYTES = 200_000; // ~200KB safe for most LLM context windows
-const MAX_INGEST_MESSAGES = 20; // absolute cap even if small messages
+const MAX_INJECT = 10;
+const MIN_PROMPT_LEN = 5;
+const AUTO_CAPTURE_SOURCE = "vmem-auto";
+const MAX_CONTENT_LEN = 500;
+const DEFAULT_MAX_INGEST_BYTES = 200_000;
+const MAX_INGEST_MESSAGES = 20;
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
-
-/** Minimal logger — matches OpenClaw's PluginLogger shape. */
 interface Logger {
   info: (msg: string) => void;
   error: (msg: string) => void;
 }
 
-/**
- * Hook handler types mirroring OpenClaw's PluginHookHandlerMap.
- * We define them locally to avoid importing OpenClaw types at the module level.
- */
 interface HookApi {
   on: (hookName: string, handler: (...args: unknown[]) => unknown, opts?: { priority?: number }) => void;
 }
@@ -50,12 +41,6 @@ interface HookApi {
 // Message selection (size-aware)
 // ---------------------------------------------------------------------------
 
-/**
- * Select messages from the end of the conversation, newest first,
- * until we hit the byte budget or message cap.
- *
- * Always includes at least 1 message (even if it alone exceeds the budget).
- */
 function selectMessages(
   messages: IngestMessage[],
   maxBytes: number = DEFAULT_MAX_INGEST_BYTES,
@@ -64,16 +49,15 @@ function selectMessages(
   let totalBytes = 0;
   const selected: IngestMessage[] = [];
 
-  // Walk backwards from most recent
   for (let i = messages.length - 1; i >= 0 && selected.length < maxCount; i--) {
     const msg = messages[i];
     const msgBytes = new TextEncoder().encode(msg.content).byteLength;
 
     if (totalBytes + msgBytes > maxBytes && selected.length > 0) {
-      break; // Would exceed budget, stop (but always include at least 1)
+      break;
     }
 
-    selected.unshift(msg); // Maintain chronological order
+    selected.unshift(msg);
     totalBytes += msgBytes;
   }
 
@@ -91,15 +75,9 @@ function escapeForPrompt(text: string): string {
     .replace(/>/g, "&gt;");
 }
 
-/**
- * Format memories for injection, grouped by type for maximum comprehension:
- * 1. Pinned memories first (user-explicit preferences)
- * 2. Insights (extracted facts)
- */
 function formatMemoriesBlock(memories: Memory[]): string {
   if (memories.length === 0) return "";
 
-  // Group by memory_type, falling back to "pinned" for legacy memories
   const pinned: Memory[] = [];
   const insights: Memory[] = [];
   const other: Memory[] = [];
@@ -147,7 +125,7 @@ function formatMemoriesBlock(memories: Memory[]): string {
 }
 
 // ---------------------------------------------------------------------------
-// Context stripping (prevent re-ingesting injected memories)
+// Context stripping
 // ---------------------------------------------------------------------------
 
 function stripInjectedContext(content: string): string {
@@ -165,6 +143,16 @@ function stripInjectedContext(content: string): string {
   return s.trim();
 }
 
+function formatConversation(messages: IngestMessage[]): string {
+  return messages
+    .map((msg) => {
+      const role = msg.role.charAt(0).toUpperCase() + msg.role.slice(1).toLowerCase();
+      return `${role}: ${msg.content}`;
+    })
+    .join("\n\n")
+    .trim();
+}
+
 // ---------------------------------------------------------------------------
 // Hook registration
 // ---------------------------------------------------------------------------
@@ -173,12 +161,13 @@ export function registerHooks(
   api: HookApi,
   backend: MemoryBackend,
   logger: Logger,
-  options?: { maxIngestBytes?: number },
+  agent: MemoryAgent | null,
+  options: { maxIngestBytes?: number },
 ): void {
-  const maxIngestBytes = options?.maxIngestBytes ?? DEFAULT_MAX_INGEST_BYTES;
+  const maxIngestBytes = options.maxIngestBytes ?? DEFAULT_MAX_INGEST_BYTES;
 
   // --------------------------------------------------------------------------
-  // before_prompt_build — inject relevant memories into every LLM call
+  // before_prompt_build — tag-boosted recall (pure data, no LLM)
   // --------------------------------------------------------------------------
   api.on(
     "before_prompt_build",
@@ -190,88 +179,110 @@ export function registerHooks(
 
         const result = await backend.search({ q: prompt, limit: MAX_INJECT });
         const memories = result.data ?? [];
-
         if (memories.length === 0) return;
 
-        logger.info(`[mnemo] Injecting ${memories.length} memories into prompt context`);
+        // Tag-boosted: find tags appearing in 2+ results → search by tags
+        const tagFreq = new Map<string, number>();
+        for (const m of memories) {
+          for (const t of m.tags ?? []) {
+            tagFreq.set(t, (tagFreq.get(t) ?? 0) + 1);
+          }
+        }
 
-        return {
-          prependContext: formatMemoriesBlock(memories),
-        };
+        const topTags: string[] = [];
+        for (const [tag, count] of tagFreq) {
+          if (count >= 2) topTags.push(tag);
+        }
+
+        let allMemories = memories;
+
+        if (topTags.length > 0 && memories.length < MAX_INJECT) {
+          try {
+            const tagResult = await backend.search({
+              tags: topTags.join(","),
+              limit: MAX_INJECT - memories.length,
+            });
+            const seenIDs = new Set(memories.map((m) => m.id));
+            for (const m of tagResult.data ?? []) {
+              if (!seenIDs.has(m.id)) {
+                allMemories.push(m);
+                seenIDs.add(m.id);
+                if (allMemories.length >= MAX_INJECT) break;
+              }
+            }
+          } catch { /* tag search failed — use text results only */ }
+        }
+
+        logger.info(
+          `[vmem] Injecting ${allMemories.length} memories (${memories.length} text + ${allMemories.length - memories.length} tag-boosted)`
+        );
+
+        return { prependContext: formatMemoriesBlock(allMemories) };
       } catch (err) {
-        // Graceful degradation — never block the LLM call
-        logger.error(`[mnemo] before_prompt_build failed: ${String(err)}`);
+        logger.error(`[vmem] before_prompt_build failed: ${String(err)}`);
       }
     },
-    { priority: 50 }, // Run after most plugins but before agent start
+    { priority: 50 },
   );
 
   // --------------------------------------------------------------------------
-  // after_compaction — no-op placeholder (no client-side cache to invalidate)
+  // after_compaction — no-op placeholder
   // --------------------------------------------------------------------------
-  api.on("after_compaction", async (_event: unknown) => {
-    logger.info("[mnemo] Compaction detected — memories will be re-queried on next prompt");
+  api.on("after_compaction", async () => {
+    logger.info("[vmem] Compaction detected — memories will be re-queried on next prompt");
   });
 
   // --------------------------------------------------------------------------
-  // before_reset — save session context before /reset wipes it
+  // before_reset — save session context
   // --------------------------------------------------------------------------
   api.on("before_reset", async (event: unknown) => {
     try {
-      const evt = event as { messages?: unknown[]; reason?: string };
+      const evt = event as { messages?: unknown[] };
       const messages = evt?.messages;
       if (!messages || messages.length === 0) return;
 
-      // Extract user messages content for a session summary
       const userTexts: string[] = [];
       for (const msg of messages) {
         if (!msg || typeof msg !== "object") continue;
         const m = msg as Record<string, unknown>;
-        if (m.role !== "user") continue;
-        if (typeof m.content === "string" && m.content.length > 10) {
-          userTexts.push(m.content);
-        }
+        if (m.role !== "user" || typeof m.content !== "string") continue;
+        if (m.content.length > 10) userTexts.push(m.content);
       }
 
       if (userTexts.length === 0) return;
 
-      // Create a compact session summary (last 3 user messages, truncated)
-      const summary = userTexts
-        .slice(-3)
-        .map((t) => t.slice(0, 300))
-        .join(" | ");
-
+      const summary = userTexts.slice(-3).map((t) => t.slice(0, 300)).join(" | ");
       await backend.store({
         content: `[session-summary] ${summary}`,
         source: AUTO_CAPTURE_SOURCE,
         tags: ["auto-capture", "session-summary", "pre-reset"],
       });
 
-      logger.info("[mnemo] Session context saved before reset");
+      logger.info("[vmem] Session context saved before reset");
     } catch (err) {
-      // Best-effort — never block /reset
-      logger.error(`[mnemo] before_reset save failed: ${String(err)}`);
+      logger.error(`[vmem] before_reset save failed: ${String(err)}`);
     }
   });
 
   // --------------------------------------------------------------------------
-  // agent_end — auto-capture via smart ingest pipeline
+  // agent_end — start the Memory Agent
   //
-  // Size-aware message selection: walk backwards from most recent messages,
-  // accumulating until byte budget is hit. Then POST to tenant-scoped ingest endpoint.
-  // for server-side LLM extraction + reconciliation.
+  // Plugin only does:
+  //   1. Format messages (deterministic)
+  //   2. Start agent.processConversation() (agent handles everything via tools)
+  //   3. Log results
   // --------------------------------------------------------------------------
   api.on("agent_end", async (event: unknown) => {
+    if (!agent) return;
+
     try {
       const evt = event as {
         success?: boolean;
         messages?: unknown[];
-        sessionId?: string;
-        agentId?: string;
       };
       if (!evt?.success || !evt.messages || evt.messages.length === 0) return;
 
-      // Format raw messages into IngestMessage format
+      // Format messages (deterministic)
       const formatted: IngestMessage[] = [];
       for (const msg of evt.messages) {
         if (!msg || typeof msg !== "object") continue;
@@ -283,7 +294,6 @@ export function registerHooks(
         if (typeof m.content === "string") {
           content = m.content;
         } else if (Array.isArray(m.content)) {
-          // Handle array content blocks (e.g., Claude's content blocks)
           for (const block of m.content) {
             if (
               block &&
@@ -297,45 +307,28 @@ export function registerHooks(
         }
 
         if (!content) continue;
-
-        // Strip previously injected memory context to prevent re-ingestion
         const cleaned = stripInjectedContext(content);
-        if (cleaned) {
-          formatted.push({ role, content: cleaned });
-        }
+        if (cleaned) formatted.push({ role, content: cleaned });
       }
 
       if (formatted.length === 0) return;
 
-      // Size-aware message selection (200KB budget by default)
       const selected = selectMessages(formatted, maxIngestBytes);
-
       if (selected.length === 0) return;
 
-      const sessionId = typeof evt.sessionId === "string"
-        ? evt.sessionId
-        : `ses_${Date.now()}`;
+      const conversation = formatConversation(selected);
+      const maxLen = 1_000_000;
+      const truncated = conversation.length > maxLen
+        ? conversation.slice(0, maxLen) + "..."
+        : conversation;
 
-      const agentId = typeof evt.agentId === "string"
-        ? evt.agentId
-        : AUTO_CAPTURE_SOURCE;
+      // Delegate to the Memory Agent — it spawns a subagent session
+      // that uses global LLM + registered vmem_* tools
+      const result = await agent.processConversation(truncated);
 
-      // POST messages to unified memories endpoint — server handles LLM extraction + reconciliation
-      const result = await backend.ingest({
-        messages: selected,
-        session_id: sessionId,
-        agent_id: agentId,
-        mode: "smart",
-      });
-
-
-      if (result.status === "accepted") {
-        logger.info("[mnemo] Ingest accepted for async processing");
-      } else if ((result.memories_changed ?? 0) > 0) {
-        logger.info(
-          `[mnemo] Ingested session: memories_changed=${result.memories_changed}, status=${result.status}`
-        );
-      }
+      logger.info(
+        `[vmem] Agent done (session=${result.sessionKey}, ${result.durationMs}ms): ${result.success ? "success" : "failed"}${result.error ? " — " + result.error : ""}`
+      );
     } catch {
       // Best-effort — never fail the agent end phase
     }

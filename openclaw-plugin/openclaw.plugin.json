@@ -1,22 +1,59 @@
 {
-  "id": "mem9",
-  "name": "Mnemo Memory",
-  "description": "AI agent memory — server mode (mnemo-server). Hybrid vector + keyword search.",
+  "id": "vmem",
+  "name": "Vmem Memory",
+  "description": "AI agent memory — hybrid vector + keyword search with dedicated Memory Agent.",
   "kind": "memory",
   "configSchema": {
     "type": "object",
     "properties": {
       "apiUrl": {
         "type": "string",
-        "description": "mnemo-server URL (server mode)"
+        "description": "vmem-server URL"
       },
       "tenantID": {
         "type": "string",
-        "description": "Tenant ID for v1alpha1 mem9s routes (preferred)"
+        "description": "Tenant ID for v1alpha1 vmems routes"
+      },
+      "agentName": {
+        "type": "string",
+        "description": "Agent identity name (default: 'agent')"
+      },
+      "memoryAgentId": {
+        "type": "string",
+        "description": "Pre-created agent ID in agents.list[] (default: 'vmem-memory')"
+      },
+      "modelFallbackChain": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Model priority chain (default: qwen3-coder-plus → glm-4.7 → MiniMax-M2.5 → qwen3.5-plus)"
+      },
+      "agentMinSessions": {
+        "type": "number",
+        "description": "Min warm sessions in pool (default: 1)"
+      },
+      "agentMaxSessions": {
+        "type": "number",
+        "description": "Max sessions the pool can grow to (default: 6)"
+      },
+      "agentMaxRunsPerSession": {
+        "type": "number",
+        "description": "Runs before session rotation (default: 50)"
+      },
+      "agentRunTimeoutMs": {
+        "type": "number",
+        "description": "Timeout per agent run in ms (default: 120000)"
+      },
+      "agentIdleReapMs": {
+        "type": "number",
+        "description": "Idle time before excess sessions are reaped (default: 60000)"
+      },
+      "maxIngestBytes": {
+        "type": "number",
+        "description": "Max conversation bytes per agent_end (default: 200000)"
       },
       "apiToken": {
         "type": "string",
-        "description": "Legacy alias for tenantID (kept for backward compatibility)"
+        "description": "Legacy alias for tenantID"
       },
       "userToken": {
         "type": "string",
@@ -33,15 +70,25 @@
       "label": "Tenant ID",
       "placeholder": "uuid..."
     },
-    "apiToken": {
-      "label": "Legacy Tenant ID Alias",
-      "placeholder": "uuid...",
-      "sensitive": true
+    "memoryAgentId": {
+      "label": "Memory Agent ID",
+      "help": "Must match an entry in agents.list[]. Default: vmem-memory",
+      "advanced": true
     },
-    "userToken": {
-      "label": "Legacy Tenant ID Alias",
-      "placeholder": "uuid...",
-      "sensitive": true
+    "modelFallbackChain": {
+      "label": "Model Priority",
+      "help": "Ordered list of models for Memory Agent. First available model is used.",
+      "advanced": true
+    },
+    "agentMinSessions": {
+      "label": "Min Sessions",
+      "help": "Minimum warm sessions in pool.",
+      "advanced": true
+    },
+    "agentMaxSessions": {
+      "label": "Max Sessions",
+      "help": "Maximum sessions under load.",
+      "advanced": true
     }
   }
 }

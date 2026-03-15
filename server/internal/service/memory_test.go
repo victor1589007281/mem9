@@ -2,16 +2,12 @@ package service
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"math"
-	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/qiffang/mnemos/server/internal/domain"
-	"github.com/qiffang/mnemos/server/internal/llm"
 )
 
 func floatEqual(a, b float64) bool {
@@ -325,7 +321,7 @@ func TestSearchColdStartFallbackToKeyword(t *testing.T) {
 	}
 
 	// No embedder, no autoModel — cold start, FTS not yet available.
-	svc := NewMemoryService(memRepo, nil, nil, "", ModeSmart)
+	svc := NewMemoryService(memRepo, nil, "")
 
 	results, total, err := svc.Search(context.Background(), domain.MemoryFilter{
 		Query: "test query",
@@ -357,7 +353,7 @@ func TestSearchFTSOnlyWhenAvailable(t *testing.T) {
 		},
 	}
 
-	svc := NewMemoryService(memRepo, nil, nil, "", ModeSmart)
+	svc := NewMemoryService(memRepo, nil, "")
 
 	results, total, err := svc.Search(context.Background(), domain.MemoryFilter{
 		Query: "test query",
@@ -380,7 +376,7 @@ func TestSearchEmptyQueryReturnsList(t *testing.T) {
 	t.Parallel()
 
 	memRepo := &memoryRepoMock{}
-	svc := NewMemoryService(memRepo, nil, nil, "", ModeSmart)
+	svc := NewMemoryService(memRepo, nil, "")
 
 	results, total, err := svc.Search(context.Background(), domain.MemoryFilter{
 		Query: "",
@@ -404,7 +400,7 @@ func TestSearchIgnoresSessionAndSourceFilters(t *testing.T) {
 			{ID: "kw-1", Content: "result from keyword search", MemoryType: domain.TypeInsight, State: domain.StateActive},
 		},
 	}
-	svc := NewMemoryService(memRepo, nil, nil, "", ModeSmart)
+	svc := NewMemoryService(memRepo, nil, "")
 
 	_, _, err := svc.Search(context.Background(), domain.MemoryFilter{
 		Query:     "test query",
@@ -428,45 +424,13 @@ func TestSearchIgnoresSessionAndSourceFilters(t *testing.T) {
 	}
 }
 
-func TestCreateRequiresLLMForReconciliation(t *testing.T) {
+func TestCreateStoresPinnedMemory(t *testing.T) {
 	t.Parallel()
 
-	svc := NewMemoryService(&memoryRepoMock{}, nil, nil, "", ModeSmart)
-	_, err := svc.Create(context.Background(), "agent-1", "user prefers dark mode", nil, nil)
-	if err == nil {
-		t.Fatal("expected validation error when llm is nil")
-	}
-	var ve *domain.ValidationError
-	if !errors.As(err, &ve) {
-		t.Fatalf("expected ValidationError, got %T", err)
-	}
-	if ve.Field != "llm" {
-		t.Fatalf("expected field llm, got %s", ve.Field)
-	}
-}
-
-func TestCreateRunsReconcilePipeline(t *testing.T) {
-	t.Parallel()
-
-	callCount := 0
-	mockLLM := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		callCount++
-		resp := `{"facts": ["Uses Go 1.22"]}`
-		if callCount == 2 {
-			resp = `{"memory": [{"id": "new", "text": "Uses Go 1.22", "event": "ADD"}]}`
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
-			"choices": []map[string]any{{"message": map[string]string{"content": resp}}},
-		})
-	}))
-	defer mockLLM.Close()
-
-	llmClient := llm.New(llm.Config{APIKey: "test-key", BaseURL: mockLLM.URL, Model: "test-model"})
 	repo := &memoryRepoMock{}
-	svc := NewMemoryService(repo, llmClient, nil, "auto-model", ModeSmart)
+	svc := NewMemoryService(repo, nil, "")
 
-	mem, err := svc.Create(context.Background(), "agent-1", "I use Go 1.22", nil, nil)
+	mem, err := svc.Create(context.Background(), "agent-1", "test content", nil, nil)
 	if err != nil {
 		t.Fatalf("Create() error: %v", err)
 	}
@@ -476,7 +440,7 @@ func TestCreateRunsReconcilePipeline(t *testing.T) {
 	if len(repo.createCalls) != 1 {
 		t.Fatalf("expected 1 created memory, got %d", len(repo.createCalls))
 	}
-	if repo.createCalls[0].MemoryType != domain.TypeInsight {
-		t.Fatalf("expected insight memory type, got %s", repo.createCalls[0].MemoryType)
+	if repo.createCalls[0].MemoryType != domain.TypePinned {
+		t.Fatalf("expected pinned memory type, got %s", repo.createCalls[0].MemoryType)
 	}
 }

@@ -13,7 +13,6 @@ import (
 	"github.com/qiffang/mnemos/server/internal/config"
 	"github.com/qiffang/mnemos/server/internal/embed"
 	"github.com/qiffang/mnemos/server/internal/handler"
-	"github.com/qiffang/mnemos/server/internal/llm"
 	"github.com/qiffang/mnemos/server/internal/middleware"
 	"github.com/qiffang/mnemos/server/internal/repository"
 	"github.com/qiffang/mnemos/server/internal/repository/postgres"
@@ -54,18 +53,9 @@ func main() {
 	} else {
 		logger.Info("no embedding configured, keyword-only search active")
 	}
-	// LLM client (nil if not configured → raw ingest mode).
-	llmClient := llm.New(llm.Config{
-		APIKey:      cfg.LLMAPIKey,
-		BaseURL:     cfg.LLMBaseURL,
-		Model:       cfg.LLMModel,
-		Temperature: cfg.LLMTemperature,
-	})
-	if llmClient != nil {
-		logger.Info("LLM configured for smart ingest", "model", cfg.LLMModel)
-	} else {
-		logger.Info("no LLM configured, ingest will use raw mode")
-	}
+	// LLM is handled exclusively by the plugin (e.g. OpenClaw).
+	// Server runs in raw-ingest mode only.
+	logger.Info("server runs in raw-ingest mode (LLM handled by plugin)")
 
 	// Repositories — selected by driver.
 	tenantRepo, uploadTaskRepo := newRepos(cfg.DBDriver, db)
@@ -95,7 +85,7 @@ func main() {
 	memRepoFactory := func(db *sql.DB, autoModel string, ftsEnabled bool) repository.MemoryRepo {
 		return newMemoryRepo(cfg.DBDriver, db, autoModel, ftsEnabled)
 	}
-	srv := handler.NewServer(tenantSvc, uploadTaskRepo, cfg.UploadDir, embedder, llmClient, cfg.EmbedAutoModel, cfg.FTSEnabled, service.IngestMode(cfg.IngestMode), logger, memRepoFactory)
+	srv := handler.NewServer(tenantSvc, uploadTaskRepo, cfg.UploadDir, embedder, cfg.EmbedAutoModel, cfg.FTSEnabled, logger, memRepoFactory)
 	router := srv.Router(tenantMW, rateMW)
 
 	httpSrv := &http.Server{
@@ -114,10 +104,8 @@ func main() {
 		tenantRepo,
 		tenantPool,
 		embedder,
-		llmClient,
 		cfg.EmbedAutoModel,
 		cfg.FTSEnabled,
-		service.IngestMode(cfg.IngestMode),
 		logger,
 		cfg.WorkerConcurrency,
 	)

@@ -15,7 +15,6 @@ import (
 
 	"github.com/qiffang/mnemos/server/internal/domain"
 	"github.com/qiffang/mnemos/server/internal/embed"
-	"github.com/qiffang/mnemos/server/internal/llm"
 	"github.com/qiffang/mnemos/server/internal/middleware"
 	"github.com/qiffang/mnemos/server/internal/repository"
 	"github.com/qiffang/mnemos/server/internal/service"
@@ -30,10 +29,8 @@ type Server struct {
 	uploadTasks    repository.UploadTaskRepo
 	uploadDir      string
 	embedder       *embed.Embedder
-	llmClient      *llm.Client
 	autoModel      string
 	ftsEnabled     bool
-	ingestMode     service.IngestMode
 	logger         *slog.Logger
 	memRepoFactory MemoryRepoFactory
 	svcCache       sync.Map
@@ -45,10 +42,8 @@ func NewServer(
 	uploadTasks repository.UploadTaskRepo,
 	uploadDir string,
 	embedder *embed.Embedder,
-	llmClient *llm.Client,
 	autoModel string,
 	ftsEnabled bool,
-	ingestMode service.IngestMode,
 	logger *slog.Logger,
 	memRepoFactory MemoryRepoFactory,
 ) *Server {
@@ -57,10 +52,8 @@ func NewServer(
 		uploadTasks:    uploadTasks,
 		uploadDir:      uploadDir,
 		embedder:       embedder,
-		llmClient:      llmClient,
 		autoModel:      autoModel,
 		ftsEnabled:     ftsEnabled,
-		ingestMode:     ingestMode,
 		logger:         logger,
 		memRepoFactory: memRepoFactory,
 	}
@@ -84,8 +77,8 @@ func (s *Server) resolveServices(auth *domain.AuthInfo) resolvedSvc {
 		}
 		memRepo := s.memRepoFactory(auth.TenantDB, s.autoModel, s.ftsEnabled)
 		svc := resolvedSvc{
-			memory: service.NewMemoryService(memRepo, s.llmClient, s.embedder, s.autoModel, s.ingestMode),
-			ingest: service.NewIngestService(memRepo, s.llmClient, s.embedder, s.autoModel, s.ingestMode),
+			memory: service.NewMemoryService(memRepo, s.embedder, s.autoModel),
+			ingest: service.NewIngestService(memRepo, s.embedder, s.autoModel),
 		}
 		s.svcCache.Store(key, svc)
 		return svc
@@ -96,8 +89,8 @@ func (s *Server) resolveServices(auth *domain.AuthInfo) resolvedSvc {
 	}
 	memRepo := s.memRepoFactory(auth.TenantDB, s.autoModel, s.ftsEnabled)
 	svc := resolvedSvc{
-		memory: service.NewMemoryService(memRepo, s.llmClient, s.embedder, s.autoModel, s.ingestMode),
-		ingest: service.NewIngestService(memRepo, s.llmClient, s.embedder, s.autoModel, s.ingestMode),
+		memory: service.NewMemoryService(memRepo, s.embedder, s.autoModel),
+		ingest: service.NewIngestService(memRepo, s.embedder, s.autoModel),
 	}
 	s.svcCache.Store(key, svc)
 	return svc
@@ -119,18 +112,23 @@ func (s *Server) Router(tenantMW, rateLimitMW func(http.Handler) http.Handler) h
 	})
 
 	// Provision a new tenant — no auth, no body.
-	r.Post("/v1alpha1/mem9s", s.provisionMem9s)
+	r.Post("/v1alpha1/vmems", s.provisionVmems)
 
 	// Tenant-scoped routes — tenantMW resolves {tenantID} to DB connection.
-	r.Route("/v1alpha1/mem9s/{tenantID}", func(r chi.Router) {
+	r.Route("/v1alpha1/vmems/{tenantID}", func(r chi.Router) {
 		r.Use(tenantMW)
 
 		// Memory CRUD.
 		r.Post("/memories", s.createMemory)
+		r.Post("/memories/bulk", s.bulkCreateMemories)
 		r.Get("/memories", s.listMemories)
 		r.Get("/memories/{id}", s.getMemory)
 		r.Put("/memories/{id}", s.updateMemory)
 		r.Delete("/memories/{id}", s.deleteMemory)
+
+		// Server-side ingest support (plugin calls LLM, server handles data ops).
+		r.Post("/memories/gather", s.gatherMemories)
+		r.Post("/memories/execute", s.executeReconcile)
 
 		// Imports (async file ingest).
 		r.Post("/imports", s.createTask)
@@ -160,6 +158,17 @@ func respondError(w http.ResponseWriter, status int, msg string) {
 
 // handleError maps domain errors to HTTP status codes.
 func (s *Server) handleError(w http.ResponseWriter, err error) {
+	var vce *domain.VersionConflictError
+	if errors.As(err, &vce) {
+		respond(w, http.StatusConflict, map[string]any{
+			"error":            vce.Error(),
+			"current_memory":   vce.Current,
+			"expected_version": vce.ExpectedVersion,
+			"actual_version":   vce.ActualVersion,
+		})
+		return
+	}
+
 	switch {
 	case errors.Is(err, domain.ErrNotFound):
 		respondError(w, http.StatusNotFound, err.Error())
