@@ -51,9 +51,9 @@ func (r *MemoryRepo) Create(ctx context.Context, m *domain.Memory) error {
 	return nil
 }
 
-func (r *MemoryRepo) GetByID(ctx context.Context, id string) (*domain.Memory, error) {
+func (r *MemoryRepo) GetByID(ctx context.Context, id, agentID string) (*domain.Memory, error) {
 	row := r.db.QueryRowContext(ctx,
-		`SELECT `+allColumns+` FROM memories WHERE id = $1 AND state = 'active'`, id,
+		`SELECT `+allColumns+` FROM memories WHERE id = $1 AND agent_id = $2 AND state = 'active'`, id, agentID,
 	)
 	return scanMemory(row)
 }
@@ -61,10 +61,10 @@ func (r *MemoryRepo) GetByID(ctx context.Context, id string) (*domain.Memory, er
 func (r *MemoryRepo) UpdateOptimistic(ctx context.Context, m *domain.Memory, expectedVersion int) error {
 	tagsJSON := marshalTags(m.Tags)
 
-	query := `UPDATE memories SET content = $1, tags = $2, metadata = $3, embedding = $4, version = version + 1, updated_by = $5, updated_at = NOW() WHERE id = $6`
-	args := []any{m.Content, tagsJSON, nullJSON(m.Metadata), vecToString(m.Embedding), nullString(m.UpdatedBy), m.ID}
+	query := `UPDATE memories SET content = $1, tags = $2, metadata = $3, embedding = $4, version = version + 1, updated_by = $5, updated_at = NOW() WHERE id = $6 AND agent_id = $7`
+	args := []any{m.Content, tagsJSON, nullJSON(m.Metadata), vecToString(m.Embedding), nullString(m.UpdatedBy), m.ID, m.AgentID}
 	if expectedVersion > 0 {
-		query += " AND version = $7"
+		query += " AND version = $8"
 		args = append(args, expectedVersion)
 	}
 
@@ -79,7 +79,7 @@ func (r *MemoryRepo) UpdateOptimistic(ctx context.Context, m *domain.Memory, exp
 	return nil
 }
 
-func (r *MemoryRepo) SoftDelete(ctx context.Context, id, agentName string) error {
+func (r *MemoryRepo) SoftDelete(ctx context.Context, id, agentID string) error {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("soft delete begin tx: %w", err)
@@ -88,8 +88,8 @@ func (r *MemoryRepo) SoftDelete(ctx context.Context, id, agentName string) error
 
 	var state sql.NullString
 	err = tx.QueryRowContext(ctx,
-		`SELECT state FROM memories WHERE id = $1 FOR UPDATE`,
-		id,
+		`SELECT state FROM memories WHERE id = $1 AND agent_id = $2 FOR UPDATE`,
+		id, agentID,
 	).Scan(&state)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -102,8 +102,8 @@ func (r *MemoryRepo) SoftDelete(ctx context.Context, id, agentName string) error
 		return tx.Commit()
 	}
 	_, err = tx.ExecContext(ctx,
-		`UPDATE memories SET state = 'deleted', updated_at = NOW() WHERE id = $1`,
-		id,
+		`UPDATE memories SET state = 'deleted', updated_at = NOW() WHERE id = $1 AND agent_id = $2`,
+		id, agentID,
 	)
 	if err != nil {
 		return fmt.Errorf("soft delete update: %w", err)
@@ -112,11 +112,11 @@ func (r *MemoryRepo) SoftDelete(ctx context.Context, id, agentName string) error
 	return tx.Commit()
 }
 
-func (r *MemoryRepo) ArchiveMemory(ctx context.Context, id, supersededBy string) error {
+func (r *MemoryRepo) ArchiveMemory(ctx context.Context, id, agentID, supersededBy string) error {
 	result, err := r.db.ExecContext(ctx,
 		`UPDATE memories SET state = 'archived', superseded_by = $1, updated_at = NOW()
-		 WHERE id = $2 AND state = 'active'`,
-		supersededBy, id,
+		 WHERE id = $2 AND agent_id = $3 AND state = 'active'`,
+		supersededBy, id, agentID,
 	)
 	if err != nil {
 		return err
@@ -127,7 +127,7 @@ func (r *MemoryRepo) ArchiveMemory(ctx context.Context, id, supersededBy string)
 	return nil
 }
 
-func (r *MemoryRepo) ArchiveAndCreate(ctx context.Context, archiveID, supersededBy string, newMem *domain.Memory) error {
+func (r *MemoryRepo) ArchiveAndCreate(ctx context.Context, archiveID, agentID, supersededBy string, newMem *domain.Memory) error {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
@@ -136,8 +136,8 @@ func (r *MemoryRepo) ArchiveAndCreate(ctx context.Context, archiveID, superseded
 
 	result, err := tx.ExecContext(ctx,
 		`UPDATE memories SET state = 'archived', superseded_by = $1, updated_at = NOW()
-		 WHERE id = $2 AND state = 'active'`,
-		supersededBy, archiveID,
+		 WHERE id = $2 AND agent_id = $3 AND state = 'active'`,
+		supersededBy, archiveID, agentID,
 	)
 	if err != nil {
 		return fmt.Errorf("archive old memory: %w", err)
@@ -166,10 +166,10 @@ func (r *MemoryRepo) ArchiveAndCreate(ctx context.Context, archiveID, superseded
 	return tx.Commit()
 }
 
-func (r *MemoryRepo) SetState(ctx context.Context, id string, state domain.MemoryState) error {
+func (r *MemoryRepo) SetState(ctx context.Context, id, agentID string, state domain.MemoryState) error {
 	result, err := r.db.ExecContext(ctx,
-		`UPDATE memories SET state = $1, updated_at = NOW() WHERE id = $2 AND state = 'active'`,
-		string(state), id,
+		`UPDATE memories SET state = $1, updated_at = NOW() WHERE id = $2 AND agent_id = $3 AND state = 'active'`,
+		string(state), id, agentID,
 	)
 	if err != nil {
 		return err
@@ -225,10 +225,11 @@ func (r *MemoryRepo) List(ctx context.Context, f domain.MemoryFilter) ([]domain.
 	return memories, total, rows.Err()
 }
 
-func (r *MemoryRepo) Count(ctx context.Context) (int, error) {
+func (r *MemoryRepo) Count(ctx context.Context, agentID string) (int, error) {
 	var count int
 	err := r.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM memories WHERE state = 'active'`,
+		`SELECT COUNT(*) FROM memories WHERE agent_id = $1 AND state = 'active'`,
+		agentID,
 	).Scan(&count)
 	if err != nil {
 		return 0, fmt.Errorf("count memories: %w", err)
@@ -236,13 +237,13 @@ func (r *MemoryRepo) Count(ctx context.Context) (int, error) {
 	return count, nil
 }
 
-func (r *MemoryRepo) ListBootstrap(ctx context.Context, limit int) ([]domain.Memory, error) {
+func (r *MemoryRepo) ListBootstrap(ctx context.Context, agentID string, limit int) ([]domain.Memory, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 20
 	}
 	rows, err := r.db.QueryContext(ctx,
-		`SELECT `+allColumns+` FROM memories WHERE state = 'active' ORDER BY updated_at DESC LIMIT $1`,
-		limit,
+		`SELECT `+allColumns+` FROM memories WHERE agent_id = $1 AND state = 'active' ORDER BY updated_at DESC LIMIT $2`,
+		agentID, limit,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("list bootstrap: %w", err)

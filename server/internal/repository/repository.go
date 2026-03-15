@@ -10,14 +10,14 @@ import (
 // MemoryRepo defines storage operations for memories.
 type MemoryRepo interface {
 	Create(ctx context.Context, m *domain.Memory) error
-	GetByID(ctx context.Context, id string) (*domain.Memory, error)
+	GetByID(ctx context.Context, id, agentID string) (*domain.Memory, error)
 	UpdateOptimistic(ctx context.Context, m *domain.Memory, expectedVersion int) error
-	SoftDelete(ctx context.Context, id, agentName string) error
-	ArchiveMemory(ctx context.Context, id, supersededBy string) error
-	ArchiveAndCreate(ctx context.Context, archiveID, supersededBy string, newMem *domain.Memory) error
-	SetState(ctx context.Context, id string, state domain.MemoryState) error
+	SoftDelete(ctx context.Context, id, agentID string) error
+	ArchiveMemory(ctx context.Context, id, agentID, supersededBy string) error
+	ArchiveAndCreate(ctx context.Context, archiveID, agentID, supersededBy string, newMem *domain.Memory) error
+	SetState(ctx context.Context, id, agentID string, state domain.MemoryState) error
 	List(ctx context.Context, f domain.MemoryFilter) (memories []domain.Memory, total int, err error)
-	Count(ctx context.Context) (int, error)
+	Count(ctx context.Context, agentID string) (int, error)
 	BulkCreate(ctx context.Context, memories []*domain.Memory) error
 
 	// VectorSearch performs ANN search using cosine distance with a pre-computed vector.
@@ -35,7 +35,7 @@ type MemoryRepo interface {
 	// FTSAvailable reports whether full-text search is usable on this database.
 	FTSAvailable() bool
 
-	ListBootstrap(ctx context.Context, limit int) ([]domain.Memory, error)
+	ListBootstrap(ctx context.Context, agentID string, limit int) ([]domain.Memory, error)
 }
 
 // TenantRepo manages tenant records in the control plane DB.

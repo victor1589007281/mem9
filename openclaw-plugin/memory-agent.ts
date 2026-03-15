@@ -15,6 +15,8 @@
  * - Idle excess sessions are reaped after idleReapMs
  */
 
+import type { Memory } from "./types.js";
+
 export const MEMORY_AGENT_ID = "vmem-memory";
 
 // ---------------------------------------------------------------------------
@@ -92,6 +94,13 @@ interface Session {
 // MemoryAgent
 // ---------------------------------------------------------------------------
 
+export interface ReconcileEvent {
+  type: "store" | "update" | "delete";
+  memory: Memory;
+  reason?: string;
+  previous_version?: string;
+}
+
 export class MemoryAgent {
   private readonly subagent: SubagentRuntime;
   private readonly agentId: string;
@@ -138,9 +147,9 @@ export class MemoryAgent {
    * The session is scoped to the pre-created agent — OpenClaw routes by
    * session key format: `agent:<agentId>:subagent:pool-<N>`
    */
-  async processConversation(conversation: string): Promise<AgentResult> {
+  async processConversation(conversation: string, parentAgentId: string): Promise<AgentResult> {
     const startMs = Date.now();
-    const session = await this.borrowSession();
+    const session = await this.borrowSession(parentAgentId);
 
     try {
       const result = await this.runOnSession(session, conversation);
@@ -157,8 +166,8 @@ export class MemoryAgent {
   }
 
   /** Process multiple conversations in parallel (bounded by pool). */
-  async processConversationsBatch(conversations: string[]): Promise<AgentResult[]> {
-    return Promise.all(conversations.map((c) => this.processConversation(c)));
+  async processConversationsBatch(conversations: string[], parentAgentId: string): Promise<AgentResult[]> {
+    return Promise.all(conversations.map((c) => this.processConversation(c, parentAgentId)));
   }
 
   /** Graceful shutdown — destroy all sessions. */
@@ -181,14 +190,12 @@ export class MemoryAgent {
   // -----------------------------------------------------------------------
 
   private warmup(): void {
-    for (let i = 0; i < this.minSessions; i++) {
-      this.createSession();
-    }
+    // We don't warmup anymore because we need parentAgentId
   }
 
-  private createSession(): Session {
+  private createSession(parentAgentId: string): Session {
     const poolId = ++this.sessionSeq;
-    const key = `agent:${this.agentId}:subagent:pool-${poolId}`;
+    const key = `agent:${this.agentId}:subagent:${parentAgentId}:pool-${poolId}`;
     const session: Session = {
       key,
       runCount: 0,
@@ -202,14 +209,16 @@ export class MemoryAgent {
 
   /**
    * Borrow strategy:
-   *   1. Pick idle session (least recently used → spread context evenly)
+   *   1. Pick idle session for this parentAgentId
    *   2. If none idle + pool < max → scale up
    *   3. If pool at max → FIFO wait queue
    */
-  private async borrowSession(): Promise<Session> {
+  private async borrowSession(parentAgentId: string): Promise<Session> {
     let oldest: Session | null = null;
+    const prefix = `agent:${this.agentId}:subagent:${parentAgentId}:`;
+    
     for (const s of this.sessions.values()) {
-      if (!s.busy) {
+      if (!s.busy && s.key.startsWith(prefix)) {
         if (!oldest || s.lastUsedAt < oldest.lastUsedAt) oldest = s;
       }
     }
@@ -219,7 +228,7 @@ export class MemoryAgent {
     }
 
     if (this.sessions.size < this.maxSessions) {
-      const s = this.createSession();
+      const s = this.createSession(parentAgentId);
       s.busy = true;
       return s;
     }
@@ -246,12 +255,15 @@ export class MemoryAgent {
   }
 
   private rotateSession(old: Session): void {
+    const parts = old.key.split(":");
+    const parentAgentId = parts.length >= 4 ? parts[3] : "agent";
+
     this.sessions.delete(old.key);
     this.subagent
       .deleteSession({ sessionKey: old.key, deleteTranscript: true })
       .catch(() => {});
 
-    const fresh = this.createSession();
+    const fresh = this.createSession(parentAgentId);
     const waiter = this.waitQueue.shift();
     if (waiter) {
       fresh.busy = true;
@@ -271,7 +283,7 @@ export class MemoryAgent {
   }
 
   private reapIdle(): void {
-    if (this.sessions.size <= this.minSessions) return;
+    if (this.sessions.size <= 0) return;
 
     const now = Date.now();
     const candidates: Session[] = [];
@@ -283,7 +295,7 @@ export class MemoryAgent {
 
     candidates.sort((a, b) => a.lastUsedAt - b.lastUsedAt);
     for (const s of candidates) {
-      if (this.sessions.size <= this.minSessions) break;
+      if (this.sessions.size <= 0) break;
       this.sessions.delete(s.key);
       this.subagent
         .deleteSession({ sessionKey: s.key, deleteTranscript: true })
@@ -304,6 +316,7 @@ export class MemoryAgent {
         sessionKey: session.key,
         message: this.buildMessage(conversation),
         lane: "subagent",
+        idempotencyKey: `vmem-${Date.now()}-${Math.random().toString(36).substring(7)}`,
       });
 
       session.runCount++;

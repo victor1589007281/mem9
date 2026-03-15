@@ -51,7 +51,7 @@ type ExecuteResult struct {
 // Gather searches existing memories relevant to the given facts using parallel goroutines.
 // Each fact triggers a search (up to maxGatherConcurrency in parallel), results are
 // deduplicated, truncated to gatherContentMaxLen, and capped at maxExistingMemories.
-func (s *MemoryService) Gather(ctx context.Context, req GatherRequest) (*GatherResult, error) {
+func (s *MemoryService) Gather(ctx context.Context, agentID string, req GatherRequest) (*GatherResult, error) {
 	if len(req.Facts) == 0 {
 		return &GatherResult{Existing: []domain.Memory{}}, nil
 	}
@@ -73,8 +73,9 @@ func (s *MemoryService) Gather(ctx context.Context, req GatherRequest) (*GatherR
 			defer func() { <-sem }()
 
 			filter := domain.MemoryFilter{
-				Query: query,
-				Limit: perFactSearchLimit,
+				Query:   query,
+				Limit:   perFactSearchLimit,
+				AgentID: agentID, // Pass AgentID for isolation
 			}
 			mems, _, err := s.Search(ctx, filter)
 			resultsCh <- searchResult{memories: mems, err: err}
@@ -121,7 +122,7 @@ func (s *MemoryService) Gather(ctx context.Context, req GatherRequest) (*GatherR
 
 // Execute applies reconcile events using parallel goroutines.
 // ADD items are batch-created, UPDATE/DELETE run concurrently.
-func (s *MemoryService) Execute(ctx context.Context, agentName string, req ExecuteRequest) (*ExecuteResult, error) {
+func (s *MemoryService) Execute(ctx context.Context, agentID string, req ExecuteRequest) (*ExecuteResult, error) {
 	existingMap := make(map[string]string, len(req.ExistingIDs))
 	for i, id := range req.ExistingIDs {
 		existingMap[fmt.Sprintf("%d", i)] = id
@@ -166,7 +167,7 @@ func (s *MemoryService) Execute(ctx context.Context, agentName string, req Execu
 				sem <- struct{}{}
 				defer func() { <-sem }()
 
-				updated, err := s.Update(ctx, agentName, id, content, tags, nil, 0)
+				updated, err := s.Update(ctx, agentID, id, content, tags, nil, 0)
 				mu.Lock()
 				defer mu.Unlock()
 				if err != nil || updated == nil {
@@ -188,7 +189,7 @@ func (s *MemoryService) Execute(ctx context.Context, agentName string, req Execu
 				sem <- struct{}{}
 				defer func() { <-sem }()
 
-				err := s.Delete(ctx, id, agentName)
+				err := s.Delete(ctx, id, agentID)
 				mu.Lock()
 				defer mu.Unlock()
 				if err != nil {
@@ -204,7 +205,7 @@ func (s *MemoryService) Execute(ctx context.Context, agentName string, req Execu
 	wg.Wait()
 
 	if len(toAdd) > 0 {
-		created, err := s.BulkCreate(ctx, agentName, toAdd)
+		created, err := s.BulkCreate(ctx, agentID, toAdd)
 		if err != nil {
 			slog.Warn("execute: bulk create failed", "err", err)
 			warnings += len(toAdd)
@@ -224,7 +225,7 @@ func (s *MemoryService) Execute(ctx context.Context, agentName string, req Execu
 }
 
 // TagSearch searches memories by tags only (no text query), used for tag-aware recall.
-func (s *MemoryService) TagSearch(ctx context.Context, tags []string, limit int) ([]domain.Memory, error) {
+func (s *MemoryService) TagSearch(ctx context.Context, agentID string, tags []string, limit int) ([]domain.Memory, error) {
 	if len(tags) == 0 {
 		return nil, nil
 	}
@@ -232,8 +233,9 @@ func (s *MemoryService) TagSearch(ctx context.Context, tags []string, limit int)
 		limit = 10
 	}
 	filter := domain.MemoryFilter{
-		Tags:  tags,
-		Limit: limit,
+		Tags:    tags,
+		Limit:   limit,
+		AgentID: agentID,
 	}
 	results, _, err := s.memories.List(ctx, filter)
 	if err != nil {
@@ -243,13 +245,14 @@ func (s *MemoryService) TagSearch(ctx context.Context, tags []string, limit int)
 }
 
 // GatherForTags extracts common tags from existing memories, for tag-aware search boost.
-func (s *MemoryService) GatherForTags(ctx context.Context, query string, limit int) ([]domain.Memory, error) {
+func (s *MemoryService) GatherForTags(ctx context.Context, agentID string, query string, limit int) ([]domain.Memory, error) {
 	if limit <= 0 {
 		limit = 10
 	}
 	filter := domain.MemoryFilter{
-		Query: query,
-		Limit: limit,
+		Query:   query,
+		Limit:   limit,
+		AgentID: agentID,
 	}
 	results, _, err := s.Search(ctx, filter)
 	if err != nil {
@@ -282,7 +285,7 @@ func (s *MemoryService) GatherForTags(ctx context.Context, query string, limit i
 		return results, nil
 	}
 
-	tagResults, err := s.TagSearch(ctx, topTags, limit)
+	tagResults, err := s.TagSearch(ctx, agentID, topTags, limit)
 	if err != nil {
 		return results, nil
 	}

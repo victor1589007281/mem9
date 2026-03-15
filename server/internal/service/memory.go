@@ -75,8 +75,8 @@ func (s *MemoryService) Create(ctx context.Context, agentID, content string, tag
 }
 
 // Get returns a single memory by ID.
-func (s *MemoryService) Get(ctx context.Context, id string) (*domain.Memory, error) {
-	return s.memories.GetByID(ctx, id)
+func (s *MemoryService) Get(ctx context.Context, agentID, id string) (*domain.Memory, error) {
+	return s.memories.GetByID(ctx, id, agentID)
 }
 
 func (s *MemoryService) Search(ctx context.Context, filter domain.MemoryFilter) ([]domain.Memory, int, error) {
@@ -84,8 +84,6 @@ func (s *MemoryService) Search(ctx context.Context, filter domain.MemoryFilter) 
 		return s.memories.List(ctx, filter)
 	}
 	searchFilter := filter
-	searchFilter.SessionID = ""
-	searchFilter.Source = ""
 
 	slog.Info("memory search", "query", filter.Query, "auto_model", s.autoModel, "fts", s.memories.FTSAvailable())
 	if s.autoModel != "" {
@@ -341,8 +339,8 @@ func applyTypeWeights(mems map[string]domain.Memory, scores map[string]float64) 
 // VersionConflictError containing the current memory so the client (plugin)
 // can perform LLM-based merge and retry.
 // When If-Match is 0 (not provided), falls back to LWW (last writer wins).
-func (s *MemoryService) Update(ctx context.Context, agentName, id, content string, tags []string, metadata json.RawMessage, ifMatch int) (*domain.Memory, error) {
-	current, err := s.memories.GetByID(ctx, id)
+func (s *MemoryService) Update(ctx context.Context, agentID, id, content string, tags []string, metadata json.RawMessage, ifMatch int) (*domain.Memory, error) {
+	current, err := s.memories.GetByID(ctx, id, agentID)
 	if err != nil {
 		return nil, err
 	}
@@ -352,7 +350,7 @@ func (s *MemoryService) Update(ctx context.Context, agentName, id, content strin
 			"memory_id", id,
 			"expected_version", ifMatch,
 			"actual_version", current.Version,
-			"agent", agentName,
+			"agent", agentID,
 		)
 		return nil, &domain.VersionConflictError{
 			Current:         current,
@@ -378,7 +376,7 @@ func (s *MemoryService) Update(ctx context.Context, agentName, id, content strin
 	if metadata != nil {
 		current.Metadata = metadata
 	}
-	current.UpdatedBy = agentName
+	current.UpdatedBy = agentID
 
 	if contentChanged && s.autoModel == "" && s.embedder != nil {
 		embedding, err := s.embedder.Embed(ctx, current.Content)
@@ -392,7 +390,7 @@ func (s *MemoryService) Update(ctx context.Context, agentName, id, content strin
 		return nil, err
 	}
 
-	updated, err := s.memories.GetByID(ctx, id)
+	updated, err := s.memories.GetByID(ctx, id, agentID)
 	if err != nil {
 		current.Version++
 		return current, nil
@@ -400,18 +398,18 @@ func (s *MemoryService) Update(ctx context.Context, agentName, id, content strin
 	return updated, nil
 }
 
-func (s *MemoryService) Delete(ctx context.Context, id, agentName string) error {
-	return s.memories.SoftDelete(ctx, id, agentName)
+func (s *MemoryService) Delete(ctx context.Context, id, agentID string) error {
+	return s.memories.SoftDelete(ctx, id, agentID)
 }
 
-func (s *MemoryService) Bootstrap(ctx context.Context, limit int) ([]domain.Memory, error) {
+func (s *MemoryService) Bootstrap(ctx context.Context, agentID string, limit int) ([]domain.Memory, error) {
 	if limit <= 0 {
 		limit = 20
 	}
 	if limit > 100 {
 		limit = 100
 	}
-	return s.memories.ListBootstrap(ctx, limit)
+	return s.memories.ListBootstrap(ctx, agentID, limit)
 }
 
 // BulkCreate creates multiple memories at once.

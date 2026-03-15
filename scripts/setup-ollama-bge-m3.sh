@@ -16,6 +16,7 @@ set -euo pipefail
 
 readonly MODEL="bge-m3"
 readonly EMBED_DIMS=1024
+readonly OLLAMA_MODELS="/mnt/data/ollama_models"
 readonly OLLAMA_HOST="${OLLAMA_HOST:-http://localhost:11434}"
 readonly HEALTH_RETRIES=30
 readonly HEALTH_INTERVAL=2
@@ -50,7 +51,8 @@ is_ollama_running() {
 is_model_available() {
   local tags
   tags=$(curl -sf "${OLLAMA_HOST}/api/tags" 2>/dev/null || echo "")
-  echo "$tags" | grep -q "\"${MODEL}\""
+  # Match "bge-m3" followed by optionally :latest or other tags
+  echo "$tags" | grep -q "\"${MODEL}:" || echo "$tags" | grep -q "\"${MODEL}\""
 }
 
 # ---------------------------------------------------------------------------
@@ -116,13 +118,30 @@ start_ollama() {
       fi
       ;;
     linux)
-      # Linux: try systemd first, then manual
+      # Linux: setup custom storage, then try systemd first, then manual
       if command -v systemctl &>/dev/null && systemctl list-unit-files ollama.service &>/dev/null; then
-        sudo systemctl start ollama 2>/dev/null || true
-        info "Started via systemctl"
+        info "Configuring custom storage at ${OLLAMA_MODELS} for systemd..."
+        sudo mkdir -p /etc/systemd/system/ollama.service.d
+        echo "[Service]" | sudo tee /etc/systemd/system/ollama.service.d/override.conf >/dev/null
+         echo "Environment=\"OLLAMA_MODELS=${OLLAMA_MODELS}\"" | sudo tee -a /etc/systemd/system/ollama.service.d/override.conf >/dev/null
+         echo "Environment=\"OLLAMA_NUM_PARALLEL=4\"" | sudo tee -a /etc/systemd/system/ollama.service.d/override.conf >/dev/null
+         echo "Environment=\"OLLAMA_MAX_LOADED_MODELS=4\"" | sudo tee -a /etc/systemd/system/ollama.service.d/override.conf >/dev/null
+         echo "Environment=\"OLLAMA_KEEP_ALIVE=-1\"" | sudo tee -a /etc/systemd/system/ollama.service.d/override.conf >/dev/null
+         
+         # Ensure correct ownership for ollama user
+        if id "ollama" &>/dev/null; then
+          sudo chown -R ollama:ollama "${OLLAMA_MODELS}"
+        else
+          sudo chown -R $USER:$USER "${OLLAMA_MODELS}"
+        fi
+
+        sudo systemctl daemon-reload
+        sudo systemctl restart ollama 2>/dev/null || true
+        info "Configured and restarted via systemctl"
       else
+        export OLLAMA_MODELS="${OLLAMA_MODELS}"
         nohup ollama serve > /tmp/ollama.log 2>&1 &
-        info "Started ollama serve (PID: $!), logs at /tmp/ollama.log"
+        info "Started ollama serve (PID: $!) with OLLAMA_MODELS=${OLLAMA_MODELS}, logs at /tmp/ollama.log"
       fi
       ;;
   esac

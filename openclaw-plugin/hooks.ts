@@ -159,7 +159,7 @@ function formatConversation(messages: IngestMessage[]): string {
 
 export function registerHooks(
   api: HookApi,
-  backend: MemoryBackend,
+  backendResolver: (agentId: string, sessionKey?: string) => MemoryBackend,
   logger: Logger,
   agent: MemoryAgent | null,
   options: { maxIngestBytes?: number },
@@ -171,8 +171,11 @@ export function registerHooks(
   // --------------------------------------------------------------------------
   api.on(
     "before_prompt_build",
-    async (event: unknown) => {
+    async (event: unknown, context: any) => {
       try {
+        const agentId = context?.agentId || "default";
+        const backend = backendResolver(agentId, context?.sessionKey);
+
         const evt = event as { prompt?: string };
         const prompt = evt?.prompt;
         if (!prompt || prompt.length < MIN_PROMPT_LEN) return;
@@ -235,8 +238,11 @@ export function registerHooks(
   // --------------------------------------------------------------------------
   // before_reset — save session context
   // --------------------------------------------------------------------------
-  api.on("before_reset", async (event: unknown) => {
+  api.on("before_reset", async (event: unknown, context: any) => {
     try {
+      const agentId = context?.agentId || "default";
+      const backend = backendResolver(agentId, context?.sessionKey);
+
       const evt = event as { messages?: unknown[] };
       const messages = evt?.messages;
       if (!messages || messages.length === 0) return;
@@ -272,10 +278,11 @@ export function registerHooks(
   //   2. Start agent.processConversation() (agent handles everything via tools)
   //   3. Log results
   // --------------------------------------------------------------------------
-  api.on("agent_end", async (event: unknown) => {
+  api.on("agent_end", async (event: unknown, context: any) => {
     if (!agent) return;
 
     try {
+      const agentId = context?.agentId || "default";
       const evt = event as {
         success?: boolean;
         messages?: unknown[];
@@ -324,7 +331,7 @@ export function registerHooks(
 
       // Delegate to the Memory Agent — it spawns a subagent session
       // that uses global LLM + registered vmem_* tools
-      const result = await agent.processConversation(truncated);
+      const result = await agent.processConversation(truncated, agentId);
 
       logger.info(
         `[vmem] Agent done (session=${result.sessionKey}, ${result.durationMs}ms): ${result.success ? "success" : "failed"}${result.error ? " — " + result.error : ""}`

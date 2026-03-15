@@ -32,10 +32,8 @@ func (s *Server) createMemory(w http.ResponseWriter, r *http.Request) {
 	auth := authInfo(r)
 	svc := s.resolveServices(auth)
 
-	agentID := req.AgentID
-	if agentID == "" {
-		agentID = auth.AgentName
-	}
+	// Isolation: Always use TenantID as the primary AgentID for storage
+	agentID := auth.TenantID
 
 	hasMessages := len(req.Messages) > 0
 	hasContent := strings.TrimSpace(req.Content) != ""
@@ -122,7 +120,7 @@ func (s *Server) listMemories(w http.ResponseWriter, r *http.Request) {
 		Source:     q.Get("source"),
 		State:      q.Get("state"),
 		MemoryType: q.Get("memory_type"),
-		AgentID:    q.Get("agent_id"),
+		AgentID:    auth.TenantID, // Use TenantID for isolation
 		SessionID:  q.Get("session_id"),
 		Limit:      limit,
 		Offset:     offset,
@@ -151,7 +149,7 @@ func (s *Server) getMemory(w http.ResponseWriter, r *http.Request) {
 	svc := s.resolveServices(auth)
 	id := chi.URLParam(r, "id")
 
-	mem, err := svc.memory.Get(r.Context(), id)
+	mem, err := svc.memory.Get(r.Context(), auth.TenantID, id)
 	if err != nil {
 		s.handleError(w, err)
 		return
@@ -182,7 +180,7 @@ func (s *Server) updateMemory(w http.ResponseWriter, r *http.Request) {
 		ifMatch, _ = strconv.Atoi(h)
 	}
 
-	mem, err := svc.memory.Update(r.Context(), auth.AgentName, id, req.Content, req.Tags, req.Metadata, ifMatch)
+	mem, err := svc.memory.Update(r.Context(), auth.TenantID, id, req.Content, req.Tags, req.Metadata, ifMatch)
 	if err != nil {
 		s.handleError(w, err)
 		return
@@ -197,7 +195,7 @@ func (s *Server) deleteMemory(w http.ResponseWriter, r *http.Request) {
 	svc := s.resolveServices(auth)
 	id := chi.URLParam(r, "id")
 
-	if err := svc.memory.Delete(r.Context(), id, auth.AgentName); err != nil {
+	if err := svc.memory.Delete(r.Context(), id, auth.TenantID); err != nil {
 		s.handleError(w, err)
 		return
 	}
@@ -218,7 +216,8 @@ func (s *Server) bulkCreateMemories(w http.ResponseWriter, r *http.Request) {
 
 	auth := authInfo(r)
 	svc := s.resolveServices(auth)
-	memories, err := svc.memory.BulkCreate(r.Context(), auth.AgentName, req.Memories)
+	// Isolation: Always use TenantID for bulk creation
+	memories, err := svc.memory.BulkCreate(r.Context(), auth.TenantID, req.Memories)
 	if err != nil {
 		s.handleError(w, err)
 		return
@@ -242,7 +241,7 @@ func (s *Server) gatherMemories(w http.ResponseWriter, r *http.Request) {
 	auth := authInfo(r)
 	svc := s.resolveServices(auth)
 
-	result, err := svc.memory.Gather(r.Context(), req)
+	result, err := svc.memory.Gather(r.Context(), auth.TenantID, req)
 	if err != nil {
 		s.handleError(w, err)
 		return
@@ -263,7 +262,7 @@ func (s *Server) executeReconcile(w http.ResponseWriter, r *http.Request) {
 	auth := authInfo(r)
 	svc := s.resolveServices(auth)
 
-	result, err := svc.memory.Execute(r.Context(), auth.AgentName, req)
+	result, err := svc.memory.Execute(r.Context(), auth.TenantID, req)
 	if err != nil {
 		s.handleError(w, err)
 		return
@@ -281,7 +280,7 @@ func (s *Server) bootstrapMemories(w http.ResponseWriter, r *http.Request) {
 		limit = 20
 	}
 
-	memories, err := svc.memory.Bootstrap(r.Context(), limit)
+	memories, err := svc.memory.Bootstrap(r.Context(), auth.TenantID, limit)
 	if err != nil {
 		s.handleError(w, err)
 		return

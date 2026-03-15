@@ -6,6 +6,7 @@
  */
 
 import type { MemoryBackend } from "./backend.js";
+import type { ReconcileEvent } from "./memory-agent.js";
 import type {
   Memory,
   StoreResult,
@@ -144,7 +145,7 @@ export class ServerBackend implements MemoryBackend {
   }
 
   async executeReconcile(
-    events: Array<{ id: string; text: string; event: string; old_memory?: string; tags?: string[] }>,
+    events: ReconcileEvent[],
     existingIDs: string[],
   ): Promise<{ memories_changed: number; created_ids?: string[]; warnings: number }> {
     return this.request<{ memories_changed: number; created_ids?: string[]; warnings: number }>(

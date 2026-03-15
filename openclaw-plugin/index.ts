@@ -2,7 +2,7 @@ import type { MemoryBackend } from "./backend.js";
 import { ServerBackend } from "./server-backend.js";
 import { registerHooks } from "./hooks.js";
 import { MemoryAgent, MEMORY_AGENT_ID } from "./memory-agent.js";
-import type { SubagentRuntime } from "./memory-agent.js";
+import type { SubagentRuntime, ReconcileEvent } from "./memory-agent.js";
 import type {
   PluginConfig,
   CreateMemoryInput,
@@ -229,9 +229,10 @@ const vmemPlugin = {
     };
     let registrationPromise: Promise<string> | null = null;
     const resolveTenantID = (agentName: string): Promise<string> => {
+      // If a global tenantID is configured, it acts as a global override.
+      // Otherwise, we derive one from the agent name.
       if (configuredTenantID) return Promise.resolve(configuredTenantID);
-      if (!registrationPromise) registrationPromise = registerTenant(agentName);
-      return registrationPromise;
+      return Promise.resolve(`${agentName}-memory-tenant`);
     };
 
     // -------------------------------------------------------------------
@@ -284,22 +285,49 @@ const vmemPlugin = {
     // Tool registration
     // -------------------------------------------------------------------
     const factory: ToolFactory = (ctx: ToolContext) => {
-      const ctxAgentId = ctx.agentId ?? cfg.agentName ?? "agent";
-      return buildTools(new LazyServerBackend(
-        effectiveApiUrl, () => resolveTenantID(ctxAgentId), ctxAgentId,
-      ));
+      let ctxAgentId = ctx.agentId || cfg.agentName || "agent";
+
+      // If the caller is the memory subagent, try to extract the parent agent ID from the session key
+      if (ctxAgentId === agentId && ctx.sessionKey) {
+        const parts = ctx.sessionKey.split(":");
+        // Format: agent:vmem-memory:subagent:victor:pool-1
+        if (parts.length >= 4 && parts[2] === "subagent") {
+          ctxAgentId = parts[3];
+        }
+      }
+
+      return buildTools(
+        new LazyServerBackend(
+          effectiveApiUrl,
+          () => resolveTenantID(ctxAgentId),
+          ctxAgentId,
+        ),
+      );
     };
     api.registerTool(factory, { names: toolNames });
 
     // -------------------------------------------------------------------
     // Hook registration
     // -------------------------------------------------------------------
-    const hookBackend = new LazyServerBackend(
-      effectiveApiUrl,
-      () => resolveTenantID(cfg.agentName ?? "agent"),
-      cfg.agentName ?? "agent",
-    );
-    registerHooks(api, hookBackend, api.logger, memoryAgent, {
+    const backendResolver = (agentId: string, sessionKey?: string) => {
+      let resolvedId = agentId;
+
+      // Resolve parent agent ID if this is the memory subagent
+      if (resolvedId === MEMORY_AGENT_ID && sessionKey) {
+        const parts = sessionKey.split(":");
+        if (parts.length >= 4 && parts[2] === "subagent") {
+          resolvedId = parts[3];
+        }
+      }
+
+      return new LazyServerBackend(
+        effectiveApiUrl,
+        () => resolveTenantID(resolvedId),
+        resolvedId,
+      );
+    };
+
+    registerHooks(api, backendResolver, api.logger, memoryAgent, {
       maxIngestBytes: cfg.maxIngestBytes,
     });
   },
@@ -341,7 +369,7 @@ class LazyServerBackend implements MemoryBackend {
   async bulkStore(items: BulkStoreInput[]): Promise<Memory[]> { return (await this.resolve()).bulkStore(items); }
   async gather(facts: string[]): Promise<Memory[]> { return (await this.resolve()).gather(facts); }
   async executeReconcile(
-    events: Array<{ id: string; text: string; event: string; old_memory?: string; tags?: string[] }>,
+    events: ReconcileEvent[],
     existingIDs: string[],
   ): Promise<{ memories_changed: number; created_ids?: string[]; warnings: number }> {
     return (await this.resolve()).executeReconcile(events, existingIDs);
